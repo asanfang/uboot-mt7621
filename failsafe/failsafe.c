@@ -21,6 +21,10 @@ static int upgrade_success;
 
 extern int write_firmware_failsafe(size_t data_addr, uint32_t data_size);
 
+/* MAX3：通用分区写入与切槽，实现在 board/ralink/common/cmd_max3.c */
+extern int m3_flash_target(const char *name, const void *data, ulong size);
+extern int m3_set_slot(const char *slot);
+
 static int output_plain_file(struct httpd_response *response,
 	const char *filename)
 {
@@ -251,6 +255,150 @@ static void not_found_handler(enum httpd_uri_handler_status status,
 	}
 }
 
+/* ---------------- MAX3：按分区刷写 + 切槽 ---------------- */
+
+struct max3_status {
+	char body[384];
+	int done;
+	struct httpd_form_value *tgt;
+	struct httpd_form_value *slot;
+	struct httpd_form_value *file;
+};
+
+static void max3_index_handler(enum httpd_uri_handler_status status,
+	struct httpd_request *request, struct httpd_response *response)
+{
+	if (status == HTTP_CB_NEW)
+		output_plain_file(response, "max3.html");
+}
+
+/*
+ * 两阶段：先回头，再在 RESPONDING 里擦写。
+ * 10~96MiB 的擦写在头发出之后执行，浏览器不必等满整段。
+ */
+static void max3flash_handler(enum httpd_uri_handler_status status,
+	struct httpd_request *request, struct httpd_response *response)
+{
+	struct max3_status *st;
+	struct httpd_form_value *tgt, *slot, *file;
+	u32 hdr, n;
+	int ret, sret;
+
+	if (status == HTTP_CB_NEW) {
+		st = calloc(1, sizeof(*st));
+		if (!st) {
+			response->info.code = 500;
+			return;
+		}
+
+		tgt = httpd_request_find_value(request, "target");
+		slot = httpd_request_find_value(request, "slot");
+		file = httpd_request_find_value(request, "firmware");
+
+		if (!tgt || !file || !file->size) {
+			free(st);
+			response->status = HTTP_RESP_STD;
+			response->data = "missing target or file";
+			response->size = strlen(response->data);
+			response->info.code = 400;
+			response->info.content_type = "text/html";
+			response->info.connection_close = 1;
+			return;
+		}
+
+		st->tgt = tgt;
+		st->slot = slot;
+		st->file = file;
+
+		response->session_data = st;
+		response->status = HTTP_RESP_CUSTOM;
+		response->info.http_1_0 = 1;
+		response->info.content_length = -1;
+		response->info.connection_close = 1;
+		response->info.content_type = "text/html";
+		response->info.code = 200;
+
+		hdr = http_make_response_header(&response->info, st->body,
+						sizeof(st->body) - 1);
+		n = snprintf(st->body + hdr, sizeof(st->body) - hdr,
+			     "<p>正在写入 %s（%u 字节），请勿断电…</p>",
+			     tgt->data, (u32)file->size);
+		response->data = st->body;
+		response->size = hdr + n;
+		return;
+	}
+
+	if (status == HTTP_CB_RESPONDING) {
+		st = response->session_data;
+		if (!st || st->done) {
+			response->status = HTTP_RESP_NONE;
+			return;
+		}
+
+		ret = m3_flash_target(st->tgt->data, st->file->data,
+				      st->file->size);
+
+		sret = 0;
+		if (st->slot && st->slot->data[0] &&
+		    strcmp(st->slot->data, "keep"))
+			sret = m3_set_slot(st->slot->data);
+
+		snprintf(st->body, sizeof(st->body),
+			 "<p>目标 <b>%s</b>：%u 字节，<b>%s</b></p>"
+			 "%s%s"
+			 "<p><a href=\"/max3\">返回</a></p>",
+			 st->tgt->data, (u32)st->file->size,
+			 ret ? "失败" : "擦写并回读校验通过",
+			 (st->slot && st->slot->data[0] &&
+			  strcmp(st->slot->data, "keep")) ?
+			 (sret ? "<p>boot_slot 写入失败</p>"
+			       : "<p>boot_slot 已 saveenv</p>") : "",
+			 ret ? "<p>该分区内容不可信，请重刷</p>" : "");
+
+		response->data = st->body;
+		response->size = strlen(st->body);
+		st->done = 1;
+		return;
+	}
+
+	if (status == HTTP_CB_CLOSED) {
+		free(response->session_data);
+		response->session_data = NULL;
+	}
+}
+
+static void max3slot_handler(enum httpd_uri_handler_status status,
+	struct httpd_request *request, struct httpd_response *response)
+{
+	static char msg[192];
+	struct httpd_form_value *v;
+	int ret;
+
+	if (status != HTTP_CB_NEW)
+		return;
+
+	v = httpd_request_find_value(request, "slot");
+	if (!v) {
+		response->info.code = 400;
+		snprintf(msg, sizeof(msg),
+			 "<p>缺 slot 字段</p><p><a href=\"/max3\">返回</a></p>");
+	} else {
+		ret = m3_set_slot(v->data);
+		response->info.code = 200;
+		snprintf(msg, sizeof(msg),
+			 "<p>boot_slot = <b>%s</b>：%s</p>"
+			 "<p><a href=\"/max3\">返回</a></p>",
+			 v->data,
+			 ret ? "失败（saveenv 不可用？）" : "已 saveenv，重启生效");
+	}
+
+	response->status = HTTP_RESP_STD;
+	response->data = msg;
+	response->size = strlen(msg);
+	response->info.content_type = "text/html";
+	response->info.connection_close = 1;
+}
+
 int start_web_failsafe(void)
 {
 	struct httpd_instance *inst;
@@ -271,6 +419,9 @@ int start_web_failsafe(void)
 	httpd_register_uri_handler(inst, "/flashing", &flashing_handler, NULL);
 	httpd_register_uri_handler(inst, "/result", &result_handler, NULL);
 	httpd_register_uri_handler(inst, "/style.css", &style_handler, NULL);
+	httpd_register_uri_handler(inst, "/max3", &max3_index_handler, NULL);
+	httpd_register_uri_handler(inst, "/max3flash", &max3flash_handler, NULL);
+	httpd_register_uri_handler(inst, "/max3slot", &max3slot_handler, NULL);
 	httpd_register_uri_handler(inst, "", &not_found_handler, NULL);
 
 	net_loop(TCP);
