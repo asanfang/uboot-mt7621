@@ -29,6 +29,10 @@ obj-y += 404.o
 FILE_404.o := 404.html
 FSPATH_404.o := 404.html
 
+obj-y += max3.o
+FILE_max3.o := max3.html
+FSPATH_max3.o := max3.html
+
 obj-y += style.o
 FILE_style.o := style.css
 FSPATH_style.o := style.css

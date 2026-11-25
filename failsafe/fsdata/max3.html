@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>MAX3 引导救援</title>
+<style>
+body{font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;margin:20px;color:#1e293b;background:#f8fafc}
+h1{font-size:19px;margin:0 0 4px}
+.sub{color:#64748b;font-size:12.5px;margin-bottom:14px}
+.card{background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:16px;margin-bottom:14px;max-width:660px}
+label{display:block;margin:12px 0 4px;font-size:13.5px;font-weight:600}
+select,input[type=file]{width:100%;padding:7px;font-size:13.5px;box-sizing:border-box;border:1px solid #cbd5e1;border-radius:5px;background:#fff}
+button{margin-top:16px;width:100%;padding:10px;font-size:14px;background:#2563eb;color:#fff;border:0;border-radius:6px}
+.warn{color:#b45309;font-size:12.5px;margin-top:12px;line-height:1.6}
+.note{color:#64748b;font-size:12px;margin-top:10px;line-height:1.6}
+</style>
+</head>
+<body>
+<h1>MAX3 引导救援（U-Boot）</h1>
+<div class="sub">按分区写入；每笔写入都执行擦除 → 写入 → 回读逐字节比对</div>
+
+<div class="card">
+<form method="post" action="/max3flash" enctype="multipart/form-data">
+<label>目标分区</label>
+<select name="target">
+<option value="uboot">uboot — U-Boot 载荷（仅 0x20000–0x5FFFF，≤256 KiB）</option>
+<option value="boot">boot — A 槽引导（10 MiB，uImage 或 FIT）</option>
+<option value="bootbk">bootbk — B 槽引导（10 MiB，uImage 或 FIT）</option>
+<option value="system">system — 系统区（20 MiB，UBI）</option>
+<option value="app">app — 应用区（20 MiB，UBI）</option>
+<option value="webui">webui — 网页区（20 MiB，UBI）</option>
+<option value="online">online — 在线区（96 MiB，UBI）</option>
+<option value="oeminfo">oeminfo — 版型记录（1.5 MiB）</option>
+<option value="mnvimg">mnvimg — 模组镜像（10 MiB）</option>
+<option value="mnvbackup">mnvbackup — 参数备份（1 MiB）</option>
+<option value="mnvdefault">mnvdefault — 出厂参数（1 MiB）</option>
+<option value="mnvdload">mnvdload — 下装参数（1 MiB）</option>
+<option value="wifi">wifi — 无线校准（1 MiB）</option>
+<option value="userbkdata">userbkdata — 数据备份（5 MiB）</option>
+<option value="userdata">userdata — 用户数据（11 MiB，JFFS2，写入即清空）</option>
+</select>
+
+<label>镜像文件（整区原始数据，不做解包）</label>
+<input type="file" name="firmware">
+
+<label>写完后启动槽</label>
+<select name="slot">
+<option value="keep">保持不变</option>
+<option value="a">a — mtd1 boot</option>
+<option value="b">b — mtd2 bootbk</option>
+<option value="auto">auto — 失败自动回退</option>
+</select>
+
+<button type="submit">开始写入</button>
+
+<div class="warn">
+擦写期间不得断电。UBI 分区（system / app / webui / online）写入的是整区原始镜像；
+若只想换文件内容，请进系统后用 sysupgrade / ubiformat。
+firmware（mtd15，302 MiB）不在此页面 —— 超出可用 DRAM，只能由系统内升级。
+</div>
+</form>
+</div>
+
+<div class="card">
+<form method="post" action="/max3slot">
+<label>启动槽（只改 env，不动 NAND）</label>
+<select name="slot">
+<option value="a">a — 从 mtd1 boot 启动</option>
+<option value="b">b — 从 mtd2 bootbk 启动</option>
+<option value="auto">auto — 先 a 后 b 自动回退</option>
+</select>
+<button type="submit">应用并 saveenv</button>
+<div class="note">切槽只写环境变量，重启后生效；NAND 内容不变。</div>
+</form>
+</div>
+</body>
+</html>
