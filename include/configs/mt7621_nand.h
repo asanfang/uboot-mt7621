@@ -32,6 +32,18 @@
 #define CONFIG_SPL_NAND_DRIVERS
 #endif
 
+/*
+ * MAX3 可写环境变量
+ * 本树是 2018.09 口径：冗余环境是 #define 而不是 Kconfig 符号
+ * （env/Kconfig 里没有 ENV_OFFSET_REDUND / SYS_REDUNDAND_ENVIRONMENT），
+ * 所以只能在这里定义；CONFIG_ENV_OFFSET / CONFIG_ENV_SIZE 走 defconfig。
+ *
+ * 主副本 0x60000（mtd0 第 3 块），冗余 0x80000（第 5 块），
+ * 都在 U-Boot 自身 0x20000-0x5FFFF 之外，自升级不会互相踩。
+ */
+#define CONFIG_SYS_REDUNDAND_ENVIRONMENT
+#define CONFIG_ENV_OFFSET_REDUND	0x80000
+
 /* Network */
 #define CONFIG_IPADDR			192.168.1.1
 #define CONFIG_SERVERIP			192.168.1.2

@@ -48,4 +48,14 @@
 #define CONFIG_SYS_BAUDRATE_TABLE	{ 9600, 19200, 38400, 57600, 115200, \
 					  230400, 460800, 921600 }
 
+/*
+ * MAX3 板级按键 / 指示灯
+ * reset 键实测在 gpio14（低有效：松手=1，按住=0），
+ * 由 customize.sh 原逻辑写在这里，我们手工固化为 14。
+ */
+#ifndef __CONFIG_MT7621_RESET_LED
+#define __CONFIG_MT7621_RESET_LED
+#define MT7621_BUTTON_RESET		14
+#endif
+
 #endif  /* __CONFIG_MT7621_COMMON_H */
