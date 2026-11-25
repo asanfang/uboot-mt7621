@@ -42,8 +42,20 @@ TARGET="${TARGET:-u-boot-lzma.img}"
 make distclean >/dev/null 2>&1 || true
 make mt7621_max3_defconfig
 
+# 关键一步：非交互补全 .config。
+# 缺了这一步，在没有 tty 的环境（CI / 管道）里，syncconfig 会把"没有值"的符号
+# 当成需要交互询问，fall through 到 xfgets() 去读 stdin；读不到就打印
+# "Error in reading or end of file."，而 conf_sym() 是 while(1)，
+# 于是无限刷屏、auto.conf 永远生成不出来，编译一步也不动。
+make olddefconfig </dev/null
+
 echo "构建目标：$TARGET"
-make CROSS_COMPILE="$CB" STAGING_DIR="$STG" -j"$(nproc 2>/dev/null || echo 4)" "$TARGET"
+JOBS=$(nproc 2>/dev/null || echo 2)
+if [ "$JOBS" -gt 4 ]; then
+	JOBS=4
+fi
+echo "并行度：-j$JOBS"
+make CROSS_COMPILE="$CB" STAGING_DIR="$STG" -j"$JOBS" "$TARGET" </dev/null
 
 if [ ! -f "$TARGET" ]; then
 	echo "缺少产物 $TARGET"
