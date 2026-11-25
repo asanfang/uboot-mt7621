@@ -51,7 +51,19 @@ static int output_plain_file(struct httpd_response *response,
 	return ret;
 }
 
+/*
+ * MAX3: 根路径直接给分区刷写 / 切槽页面。
+ * 原厂 MediaTek 恢复页（整包上传）保留在 /legacy，入口不丢。
+ */
 static void index_handler(enum httpd_uri_handler_status status,
+	struct httpd_request *request,
+	struct httpd_response *response)
+{
+	if (status == HTTP_CB_NEW)
+		output_plain_file(response, "max3.html");
+}
+
+static void legacy_handler(enum httpd_uri_handler_status status,
 	struct httpd_request *request,
 	struct httpd_response *response)
 {
@@ -414,6 +426,7 @@ int start_web_failsafe(void)
 	}
 
 	httpd_register_uri_handler(inst, "/", &index_handler, NULL);
+	httpd_register_uri_handler(inst, "/legacy", &legacy_handler, NULL);
 	httpd_register_uri_handler(inst, "/cgi-bin/luci", &index_handler, NULL);
 	httpd_register_uri_handler(inst, "/upload", &upload_handler, NULL);
 	httpd_register_uri_handler(inst, "/flashing", &flashing_handler, NULL);
