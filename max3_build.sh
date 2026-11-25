@@ -52,12 +52,17 @@ make olddefconfig </dev/null
 # 防呆：.config 里若有空值（CONFIG_X="" 或 CONFIG_X=），syncconfig 会把它当成
 # NEW 符号去交互询问；没有 tty 时 conf_sym() 的 while(1) 会无限刷
 # "Error in reading or end of file."，编译永远不推进。这里直接拦住并指名。
-if grep -q '=""' .config; then
-	echo "配置里存在空值符号，会触发 syncconfig 死循环："
-	grep -n '=""' .config
+EMPTY_RE='^CONFIG_[A-Za-z0-9_]+=[[:space:]]*$'
+if grep -Eq "$EMPTY_RE" .config; then
+	echo "配置里存在无值符号（syncconfig 会交互询问，导致死循环）："
+	grep -nE "$EMPTY_RE" .config | head -n 20
 	echo "请在上游 defconfig 里给这些符号补上合法值"
 	exit 1
 fi
+
+echo "ENV 符号现值："
+grep -E '^CONFIG_ENV_(SECT_SIZE|OFFSET|OFFSET_REDUND|SIZE)=' .config || echo "  （未找到 ENV 符号）"
+
 
 echo "构建目标：$TARGET"
 JOBS=$(nproc 2>/dev/null || echo 2)
