@@ -4,7 +4,10 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - 'board/ralink/common/cmd_max3.c'
+      - 'board/ralink/**'
+      - 'failsafe/**'
+      - 'include/configs/**'
+      - 'common/autoboot.c'
       - 'configs/mt7621_max3_defconfig'
       - 'max3_build.sh'
       - '.github/workflows/max3.yml'
@@ -58,4 +61,7 @@ jobs:
           path: |
             dist/
             build.log
+            u-boot.bin
+            u-boot.map
+            u-boot
           if-no-files-found: warn
