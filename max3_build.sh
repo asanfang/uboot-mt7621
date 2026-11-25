@@ -110,59 +110,30 @@ if [ ! -f "$TARGET" ]; then
 	exit 1
 fi
 
-# ---- 载荷起始校验 / 自愈 ----
-# 现象：这条构建链产出的 u-boot.bin 会从链接地址 4 开始输出，丢掉 _start 的第一条
-#   b reset（LE 0x10000001）。链接器把 reset 定在 0x80200008，代码里所有 la 都按
-#   这个地址签发；镜像若少这 4 字节，加载到 0x80200000 后全部绝对地址引用会偏 4。
-# 判据（解压后首 4 字节）：
-#   01 00 00 10 → 正常，b reset 在位（offset=1，跳 PC+4+4 = +8）
-#   00 48 80 40 → 缺 b，首字是 delay slot 的 mtc0 zero, CP0_COUNT
-# 处置：补回 4 字节，用 lzma 工具重压缩，用本轮构建出的 tools/mkimage 重打包，
-#   与 Makefile 的 cmd_lzma / mkimage 流程同源，头由 mkimage 自己签发。
-FIX_BIN="$ROOT/u-boot.bin.fix"
-FIX_RC=0
+# ---- 载荷起始记录（只诊断，绝不改写镜像） ----
+# 本树实际被编入的是 arch/mips/mach-mt7621/start.S，它的 _start 首条就是
+#   mtc0 zero, CP0_COUNT，全文没有 b reset 标签（与 arch/mips/cpu/start.S 不同）。
+#   所以解压后首字为 00 48 80 40 是正确形态。
+# 严禁在前面插 4 字节：插入会让按 0x80200000 签发的全部绝对地址整体偏 4，
+#   加载后进去即崩，这是 2026-11 那次刷坏 mtd0 的直接原因。
+# 本段只打印判据，不做任何修改。
 if command -v python3 >/dev/null 2>&1; then
 	set +e
-	python3 - "$TARGET" "$FIX_BIN" <<'PYEOF'
+	python3 - "$TARGET" <<'PYEOF'
 import sys, lzma
-src, dst = sys.argv[1], sys.argv[2]
-raw = lzma.decompress(open(src, 'rb').read()[64:], format=lzma.FORMAT_ALONE)
+raw = lzma.decompress(open(sys.argv[1], 'rb').read()[64:], format=lzma.FORMAT_ALONE)
 head = raw[:4]
-if head == b'\x01\x00\x00\x10':
-    print('载荷起始正常：b reset 在位，未做改动')
-    sys.exit(0)
+print('解压后长度 %d，首 4 字节 %s' % (len(raw), head.hex()))
 if head == b'\x00\x48\x80\x40':
-    open(dst, 'wb').write(b'\x01\x00\x00\x10' + raw)
-    print('载荷缺少 b reset（解压后首字 mtc0），已生成补齐版')
-    sys.exit(10)
-print('载荷起始 4 字节非预期：' + head.hex())
-sys.exit(2)
+    print('入口为 mtc0 zero, CP0_COUNT：mach-mt7621/start.S 无 b reset，属正常形态，不改动')
+elif head == b'\x01\x00\x00\x10':
+    print('入口为 b reset：与 mach-mt7621/start.S 不符，可能改动过 start.S，请人工核对')
+else:
+    print('入口 4 字节非预期，请人工核对')
 PYEOF
-	FIX_RC=$?
 	set -e
 else
-	echo "无 python3，跳过载荷起始自检"
-fi
-
-if [ "$FIX_RC" -eq 10 ]; then
-	if ! command -v lzma >/dev/null 2>&1; then
-		echo "缺少 lzma 工具（xz-utils），无法重压缩"
-		exit 1
-	fi
-	if [ ! -x tools/mkimage ]; then
-		echo "缺少 tools/mkimage，无法重打包"
-		exit 1
-	fi
-	LZ_TMP="$ROOT/u-boot.bin.fix.lzma"
-	lzma -z -9 -c "$FIX_BIN" > "$LZ_TMP"
-	tools/mkimage -A mips -T firmware -C lzma -O u-boot \
-		-a 0x80200000 -e 0x80200000 \
-		-n "U-Boot 2018.09" \
-		-d "$LZ_TMP" "$TARGET"
-	echo "已重打包 $TARGET（补 4 字节后）"
-elif [ "$FIX_RC" -ne 0 ]; then
-	echo "载荷起始 4 字节非预期（python 退出码 $FIX_RC），不自动修补，请人工确认"
-	exit 1
+	echo "无 python3，跳过载荷起始记录"
 fi
 
 SIZE=$(stat -c%s "$TARGET")
@@ -176,6 +147,13 @@ fi
 
 mkdir -p dist
 cp "$TARGET" dist/
+cp "$TARGET" dist/u-boot-lzma-v3.img
+cat > dist/VERSION.txt <<EOF
+MAX3 自建 U-Boot V3
+build: $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+payload: $TARGET ($(stat -c%s "$TARGET" 2>/dev/null || echo '?') bytes)
+layout: SPL 0x00000 (untouched) / U-Boot 0x20000-0x5FFFF / env 0x60000 + 0x80000
+EOF
 cp .config dist/max3_defconfig_used
 cp u-boot.bin dist/ 2>/dev/null || true
 cp u-boot.map dist/ 2>/dev/null || true
