@@ -49,9 +49,13 @@ make mt7621_max3_defconfig
 # 于是无限刷屏、auto.conf 永远生成不出来，编译一步也不动。
 make olddefconfig </dev/null
 
-# 防呆：.config 里若有空值（CONFIG_X="" 或 CONFIG_X=），syncconfig 会把它当成
-# NEW 符号去交互询问；没有 tty 时 conf_sym() 的 while(1) 会无限刷
-# "Error in reading or end of file."，编译永远不推进。这里直接拦住并指名。
+# 防呆（必须区分两种"空"）：
+#   CONFIG_X=""   → 合法的空字符串值，syncconfig 不会询问（上游 defconfig 常态，
+#                   如 IDENT_STRING / LOCALVERSION / DEFAULT_FDT_FILE）
+#   CONFIG_X=     → 行尾什么都没有，即真正缺值，syncconfig 会把它当成 NEW 符号
+#                   去交互问；无 tty 时 conf_sym() 的 while(1) 无限刷
+#                   "Error in reading or end of file."，编译一步也不推进。
+# 所以只拦后者，前者必须放行，否则会误杀合法配置。
 EMPTY_RE='^CONFIG_[A-Za-z0-9_]+=[[:space:]]*$'
 if grep -Eq "$EMPTY_RE" .config; then
 	echo "配置里存在无值符号（syncconfig 会交互询问，导致死循环）："
@@ -60,9 +64,22 @@ if grep -Eq "$EMPTY_RE" .config; then
 	exit 1
 fi
 
+# 留证：ENV 四项现值打进日志，方便回看这轮用的到底是哪套 env 几何
 echo "ENV 符号现值："
 grep -E '^CONFIG_ENV_(SECT_SIZE|OFFSET|OFFSET_REDUND|SIZE)=' .config || echo "  （未找到 ENV 符号）"
 
+# LTO 插件兜底
+# 这版 OpenWrt gcc 12.3.0 的 specs 默认带 -fuse-linker-plugin，需要
+# libexec/gcc/<target>/<version>/liblto_plugin.so。精简工具链若缺这个插件，
+# gcc 驱动在编译第一个文件时就报 "liblto_plugin.so not found" 并直接退出，
+# 表现为 autoconf.mk.dep 生成失败、随后 auto.conf 找不到而 stop。
+# 处置：显式关掉插件依赖（-fno-use-linker-plugin），再包一层 CC 覆盖
+# Makefile:349 的 CC，保证 -E/-c/-S/链接四条路径都带上该选项。
+PLUG=$("${CB}gcc" -print-file-name=liblto_plugin.so 2>/dev/null || echo "")
+echo "liblto_plugin.so -> ${PLUG:-<未找到>}"
+CC_WRAP="$ROOT/.tcwrap-gcc"
+printf '#!/bin/sh\nexec "%s" -fno-use-linker-plugin -fno-lto "$@"\n' "${CB}gcc" > "$CC_WRAP"
+chmod +x "$CC_WRAP"
 
 echo "构建目标：$TARGET"
 JOBS=$(nproc 2>/dev/null || echo 2)
@@ -73,7 +90,9 @@ echo "并行度：-j$JOBS"
 
 set +e
 timeout "${BUILD_TIMEOUT:-1500}" \
-	make CROSS_COMPILE="$CB" STAGING_DIR="$STG" -j"$JOBS" "$TARGET" </dev/null
+	make CROSS_COMPILE="$CB" STAGING_DIR="$STG" CC="$CC_WRAP" \
+		KCFLAGS="-fno-use-linker-plugin -fno-lto" \
+		-j"$JOBS" "$TARGET" </dev/null
 RC=$?
 set -e
 if [ "$RC" -ne 0 ]; then
