@@ -30,12 +30,23 @@
 #define M3_UBOOT_LEN		0x40000UL	/* 2 块 = 256KiB 上限 */
 #define M3_SLOT_A_OFF		0x100000UL	/* mtd1 boot   */
 #define M3_SLOT_B_OFF		0xB00000UL	/* mtd2 bootbk */
-#define M3_SLOT_MAX		0xA00000UL	/* 单槽 10MiB */
+/*
+ * 单槽读取上限取 7MiB 而不是分区全长 10MiB：
+ * bootbk 在相对 +0x8A0000 处有坏块（物理 0x013A0000），读到那里会 ECC 失败。
+ * 原厂 FIT 实体 6,760,556B（约 0x672000），7MiB 足够覆盖且不碰坏块。
+ */
+#define M3_SLOT_MAX		0x700000UL	/* 单槽可读 7MiB */
+#define M3_SLOT_SIZE		0xA00000UL	/* 单槽分区全长 10MiB（写入上限） */
 
 /* ---------------- 内存窗口（DDR 0x80000000 + 256MiB） ---------------- */
 #define M3_CMD_ADDR		0x83800000UL	/* max3.cmd 落点，64KiB 足够 */
 #define M3_CMD_LIMIT		0x10000UL
-#define M3_LOAD_ADDR		0x84000000UL	/* 镜像/Bootm 落点 */
+/*
+ * 0x8C050000 = 原厂 `bootm 0xc050000` 的 KSEG0 视图（物理 201MiB）。
+ * 对齐它即可复用原厂已实测的载入点：FIT 内 kernel Load=0x81001000，
+ * 解压目标与载入源不重叠；7MiB 到 0x8C750000，仍远离 reloc 0x8FFA0000。
+ */
+#define M3_LOAD_ADDR		0x8C050000UL	/* 镜像/Bootm 落点（对齐原厂） */
 #define M3_VFY_ADDR		0x86800000UL	/* 回读校验落点 */
 
 /* ---------------- 按键窗口 ---------------- */
@@ -105,16 +116,18 @@ static int m3_field(const char *buf, const char *key, char *out, int len)
  *   补 0xFF 到页边界 -> 擦 erase_len -> 写 -> 回读逐字节比对
  * 补 0xFF 是必须的：nand write 的末尾不成页会被底层拒或写出脏数据。
  */
-static int m3_prog(ulong off, ulong erase_len, ulong size, const char *what)
+static int m3_prog_src(ulong off, ulong erase_len, ulong size, ulong src,
+		       const char *what)
 {
 	char cmd[192];
 	ulong wlen = (size + 0x7FF) & ~0x7FFUL;
 	int ret;
 
-	memset((void *)(M3_LOAD_ADDR + size), 0xFF, wlen - size);
+	/* 末页补 0xFF，否则 nand write 会因不足一页而报错 */
+	memset((void *)(src + size), 0xFF, wlen - size);
 
-	printf("MAX3: 写 %s @0x%08lx，有效 0x%lx，写到 0x%lx，擦 0x%lx\n",
-	       what, off, size, wlen, erase_len);
+	printf("MAX3: 写 %s @0x%08lx，源 0x%lx，有效 0x%lx，写到 0x%lx，擦 0x%lx\n",
+	       what, off, src, size, wlen, erase_len);
 
 	snprintf(cmd, sizeof(cmd), "nand erase 0x%lx 0x%lx", off, erase_len);
 	ret = run_command(cmd, 0);
@@ -124,7 +137,7 @@ static int m3_prog(ulong off, ulong erase_len, ulong size, const char *what)
 	}
 
 	snprintf(cmd, sizeof(cmd), "nand write 0x%lx 0x%lx 0x%lx",
-		 (ulong)M3_LOAD_ADDR, off, wlen);
+		 src, off, wlen);
 	ret = run_command(cmd, 0);
 	if (ret) {
 		printf("MAX3: 写入失败 %d\n", ret);
@@ -139,13 +152,19 @@ static int m3_prog(ulong off, ulong erase_len, ulong size, const char *what)
 		return ret;
 	}
 
-	if (memcmp((void *)M3_LOAD_ADDR, (void *)M3_VFY_ADDR, wlen)) {
+	if (memcmp((void *)src, (void *)M3_VFY_ADDR, wlen)) {
 		printf("MAX3: 回读校验不一致，%s 不可信\n", what);
 		return -1;
 	}
 
 	printf("MAX3: %s 写入并校验通过\n", what);
 	return 0;
+}
+
+/* 兼容旧调用：源固定 M3_LOAD_ADDR（TFTP 路径） */
+static int m3_prog(ulong off, ulong erase_len, ulong size, const char *what)
+{
+	return m3_prog_src(off, erase_len, size, (ulong)M3_LOAD_ADDR, what);
 }
 
 /* 从 M3_LOAD_ADDR 已落好的镜像烧到某个槽 */
@@ -160,7 +179,7 @@ static int m3_flash_slot(char slot)
 		printf("MAX3: filesize 未知，先 tftpboot 镜像\n");
 		return -1;
 	}
-	if (size > M3_SLOT_MAX - M3_NAND_ERASE) {
+	if (size > M3_SLOT_SIZE - M3_NAND_ERASE) {
 		printf("MAX3: 镜像 %lu 字节超过单槽容量\n", size);
 		return -1;
 	}
@@ -191,8 +210,18 @@ static int m3_flash_uboot(void)
 		       size, (ulong)M3_UBOOT_LEN);
 		return -1;
 	}
+	if (size < sizeof(image_header_t)) {
+		printf("MAX3: %lu 字节不足一个 uImage 头，拒绝\n", size);
+		return -1;
+	}
 	if (image_get_magic(hdr) != IH_MAGIC) {
 		printf("MAX3: 缺 uImage 头\n");
+		return -1;
+	}
+	/* hcrc 不过 = 打包或下载时头被改坏，写下去 SPL 直接不认 */
+	if (!image_check_hcrc(hdr)) {
+		printf("MAX3: uImage 头 CRC 不符（hcrc=0x%08x），拒绝\n",
+		       image_get_hcrc(hdr));
 		return -1;
 	}
 	if (image_get_comp(hdr) != IH_COMP_LZMA) {
@@ -217,6 +246,138 @@ static int m3_flash_uboot(void)
 	printf("MAX3: U-Boot 已更新（%lu 字节），重启后由 SPL 从 0x%lx 加载\n",
 	       size, (ulong)M3_UBOOT_OFF);
 	return 0;
+}
+
+/* ---------------- 通用分区写入（网页 / 命令共用） ---------------- */
+
+/*
+ * mtd15 firmware(302MiB) 刻意不在表内：网页上传体落在
+ * CONFIG_SYS_SDRAM_BASE+0x10000，可用到 reloc 区之前约 255MiB，装不下 302MiB。
+ * firmware 一律由系统内 sysupgrade/ubiformat 处理。
+ */
+enum m3_kind {
+	M3_K_UBOOT,	/* uImage + LZMA，三项头校验 */
+	M3_K_BOOT,	/* uImage 或 FIT(d00dfeed) 二选一 */
+	M3_K_RAW,	/* 原样整区镜像，只校验长度 */
+};
+
+struct m3_part {
+	const char *name;
+	ulong off;
+	ulong max;
+	u8 kind;
+};
+
+static const struct m3_part m3_parts[] = {
+	{ "uboot",     0x020000UL,  0x040000UL,  M3_K_UBOOT },
+	{ "boot",      0x100000UL,  0xA00000UL,  M3_K_BOOT  },
+	{ "bootbk",    0xB00000UL,  0xA00000UL,  M3_K_BOOT  },
+	{ "oeminfo",   0x1500000UL, 0x180000UL,  M3_K_RAW   },
+	{ "mnvdload",  0x1680000UL, 0x100000UL,  M3_K_RAW   },
+	{ "mnvbackup", 0x1780000UL, 0x100000UL,  M3_K_RAW   },
+	{ "mnvdefault",0x1880000UL, 0x100000UL,  M3_K_RAW   },
+	{ "mnvimg",    0x1980000UL, 0xA00000UL,  M3_K_RAW   },
+	{ "userbkdata",0x2380000UL, 0x500000UL,  M3_K_RAW   },
+	{ "userdata",  0x2880000UL, 0xB00000UL,  M3_K_RAW   },
+	{ "wifi",      0x3380000UL, 0x100000UL,  M3_K_RAW   },
+	{ "app",       0x3480000UL, 0x1400000UL, M3_K_RAW   },
+	{ "webui",     0x4880000UL, 0x1400000UL, M3_K_RAW   },
+	{ "system",    0x5C80000UL, 0x1400000UL, M3_K_RAW   },
+	{ "online",    0x7080000UL, 0x6000000UL, M3_K_RAW   },
+};
+
+static int m3_check_hdr(const struct m3_part *p, const void *data, ulong size)
+{
+	const image_header_t *h = data;
+	const u8 *b = data;
+
+	if (p->kind == M3_K_RAW)
+		return 0;
+
+	if (size < 4) {
+		printf("MAX3: %s 只有 %lu 字节，读不出镜像头\n", p->name, size);
+		return -1;
+	}
+
+	if (p->kind == M3_K_BOOT) {
+		/* FIT/DTB 用字节比较，避免端序差异 */
+		if (b[0] == 0xd0 && b[1] == 0x0d && b[2] == 0xfe && b[3] == 0xed)
+			return 0;
+	}
+
+	if (size < sizeof(image_header_t) || image_get_magic(h) != IH_MAGIC) {
+		printf("MAX3: %s 既不是 uImage 也不是 FIT，拒绝\n", p->name);
+		return -1;
+	}
+
+	if (p->kind == M3_K_UBOOT) {
+		if (image_get_comp(h) != IH_COMP_LZMA) {
+			printf("MAX3: uboot 不是 LZMA 载荷（SPL 只认 LZMA）\n");
+			return -1;
+		}
+		if (image_get_load(h) != CONFIG_SYS_TEXT_BASE) {
+			printf("MAX3: uboot load 0x%08x != 0x%08x\n",
+			       image_get_load(h), (unsigned)CONFIG_SYS_TEXT_BASE);
+			return -1;
+		}
+	}
+
+	return 0;
+}
+
+/*
+ * 把 data 起 size 字节写到名为 name 的分区。
+ * 返回 0 = 擦写并回读校验全部通过。
+ */
+int m3_flash_target(const char *name, const void *data, ulong size)
+{
+	const struct m3_part *p = NULL;
+	ulong erase_len;
+	int i;
+
+	if (!name || !data || !size)
+		return -1;
+
+	for (i = 0; i < (int)ARRAY_SIZE(m3_parts); i++) {
+		if (!strcmp(m3_parts[i].name, name)) {
+			p = &m3_parts[i];
+			break;
+		}
+	}
+	if (!p) {
+		printf("MAX3: 目标 '%s' 不在白名单（firmware 永久排除）\n", name);
+		return -1;
+	}
+
+	if (size > p->max) {
+		printf("MAX3: %s 上限 %lu B，收到 %lu B，拒绝\n",
+		       name, p->max, size);
+		return -1;
+	}
+
+	if (m3_check_hdr(p, data, size))
+		return -1;
+
+	erase_len = (size + M3_NAND_ERASE - 1) & ~(M3_NAND_ERASE - 1);
+	if (erase_len > p->max) {
+		printf("MAX3: %s 按 128KiB 对齐后 %lu B 超过分区上限，拒绝\n",
+		       name, erase_len);
+		return -1;
+	}
+
+	return m3_prog_src(p->off, erase_len, size, (ulong)data, p->name);
+}
+
+/* 切槽：只动 env，不碰 NAND */
+int m3_set_slot(const char *slot)
+{
+	if (!slot)
+		return -1;
+	if (strcmp(slot, "a") && strcmp(slot, "b") && strcmp(slot, "auto"))
+		return -1;
+
+	env_set("boot_slot", slot);
+	return run_command("saveenv", 0);
 }
 
 static int m3_boot_slot(char slot)
@@ -423,12 +584,37 @@ static int do_max3slot(cmd_tbl_t *cmdtp, int flag, int argc,
 	if (strcmp(v, "a") && strcmp(v, "b") && strcmp(v, "auto"))
 		return CMD_RET_USAGE;
 
-	env_set("boot_slot", v);
-	if (m3_run("saveenv"))
+	if (m3_set_slot(v))
 		printf("MAX3: saveenv 失败（环境变量可能没烧进 0x60000）\n");
 
 	printf("MAX3: boot_slot=%s\n", env_get("boot_slot"));
 	return 0;
+}
+
+/*
+ * 命令行封装写法，与 nand erase/write 原语等价但多了白名单、长度与回读校验：
+ *   tftpboot 0x84000000 boot.bin; max3flash boot 0x84000000
+ *   max3flash boot 0x84000000 0xA00000
+ */
+static int do_max3flash(cmd_tbl_t *cmdtp, int flag, int argc,
+			char *const argv[])
+{
+	ulong addr, size;
+
+	if (argc < 3)
+		return CMD_RET_USAGE;
+
+	addr = simple_strtoul(argv[2], NULL, 16);
+	size = (argc > 3) ? simple_strtoul(argv[3], NULL, 16)
+			  : env_get_ulong("filesize", 16, 0);
+
+	if (!size) {
+		printf("MAX3: 没给 size，且 filesize 为空\n");
+		return CMD_RET_FAILURE;
+	}
+
+	return m3_flash_target(argv[1], (const void *)addr, size)
+		? CMD_RET_FAILURE : 0;
 }
 
 static int do_max3boot(cmd_tbl_t *cmdtp, int flag, int argc,
@@ -499,3 +685,11 @@ U_BOOT_CMD(max3uboot, 1, 0, do_max3uboot,
 U_BOOT_CMD(max3dload, 1, 0, do_max3dload,
 	   "boot slot b with upgrade_mode=dload (experimental)",
 	   "");
+
+U_BOOT_CMD(max3flash, 4, 0, do_max3flash,
+	   "flash a whitelisted NAND partition (erase+write+readback verify)",
+	   "<part> <addr> [size]\n"
+	   "    part: uboot boot bootbk oeminfo mnvdload mnvbackup mnvdefault\n"
+	   "          mnvimg userbkdata userdata wifi app webui system online\n"
+	   "    size 省略时用 filesize（tftpboot 之后）\n"
+	   "    firmware(mtd15) 不在白名单，请由系统内 sysupgrade 处理");
