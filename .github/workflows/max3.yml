@@ -45,9 +45,10 @@ jobs:
           PREFIX="$(cat tc_path.txt)/mipsel-openwrt-linux-"
           echo "PREFIX=$PREFIX"
           chmod +x max3_build.sh
-          stdbuf -oL -eL ./max3_build.sh "$PREFIX" 2>&1 | tee build.log | tail -n 400
+          stdbuf -oL -eL ./max3_build.sh "$PREFIX" 2>&1 | tee build.log \
+            | awk '/Error in reading or end of file/ { n++; if (n<=3) print; next } { print }'
           echo "---- 日志末尾 ----"
-          tail -n 30 build.log
+          tail -n 40 build.log
 
       - name: 归档产物
         if: always()
