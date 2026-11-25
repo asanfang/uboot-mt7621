@@ -55,7 +55,19 @@ if [ "$JOBS" -gt 4 ]; then
 	JOBS=4
 fi
 echo "并行度：-j$JOBS"
-make CROSS_COMPILE="$CB" STAGING_DIR="$STG" -j"$JOBS" "$TARGET" </dev/null
+
+set +e
+timeout "${BUILD_TIMEOUT:-1500}" \
+	make CROSS_COMPILE="$CB" STAGING_DIR="$STG" -j"$JOBS" "$TARGET" </dev/null
+RC=$?
+set -e
+if [ "$RC" -ne 0 ]; then
+	echo "构建未成功，退出码 $RC"
+	if [ "$RC" -eq 124 ]; then
+		echo "已超过 ${BUILD_TIMEOUT:-1500} 秒仍未完成，按超时中止"
+	fi
+	exit "$RC"
+fi
 
 if [ ! -f "$TARGET" ]; then
 	echo "缺少产物 $TARGET"
