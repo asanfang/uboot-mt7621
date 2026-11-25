@@ -49,4 +49,18 @@
 #define CONFIG_SERVERIP			192.168.1.2
 #define CONFIG_NETMASK			255.255.255.0
 
+/*
+ * MAX3 默认环境（V3）
+ *
+ * 只放一个启动槽开关，不放 bootargs：
+ * 原厂 FIT 的 chosen node 已带完整 bootargs（rootfs/ubi/ramoops 一套），
+ * 一旦 env 里也存在 bootargs，bootm 会用它覆盖 chosen，反而起不来。
+ * 需要改启动参数时用 `max3dload` 或现场 env set，不要写进默认环境。
+ *
+ * auto = 先 a 后 b，a 起不来才 silently 换 b（失败会打日志，不静默）。
+ * 命令行手动换槽：max3slot a|b|auto（会 saveenv）。
+ */
+#define CONFIG_EXTRA_ENV_SETTINGS \
+	"boot_slot=auto\0"
+
 #endif  /* __CONFIG_H */
