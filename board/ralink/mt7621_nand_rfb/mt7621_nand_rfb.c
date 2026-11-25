@@ -78,6 +78,22 @@ static int pins_unused_init(const int *pinlist, unsigned listsize)
 #ifdef CONFIG_LAST_STAGE_INIT
 int last_stage_init(void)
 {
+#ifdef MT7621_BUTTON_RESET
+	/*
+	 * MAX3: 关闭板载外置看门狗
+	 *
+	 * 原厂 U-Boot 在 GPIO0(wdt_di)/GPIO10(wdt_set) 上控制一颗外置看门狗，
+	 * 复位后默认使能，约 46 秒无喂狗即硬复位。这会让 console 停留、
+	 * httpd/tftploop 网页救援、按分区刷写等长操作中途被打断。
+	 *
+	 * 实测：gpio clear 10 -> "mt7621-gpio10: output: 0"，sleep 60 不再复位，
+	 * 确认 pin10 高=使能、低=禁用。此处在进入命令行之前关闭，
+	 * 之后 U-Boot 全程不再受 46 秒窗口约束。
+	 * Linux 侧原厂应用启动后会自行重新使能并喂狗，不受影响。
+	 */
+	gpio_output_init(10, 0, "wdt_set");
+#endif
+
 #if defined(CONFIG_BOARD_MT7621_NAND_TEMPLATE)
 	#define MT7621_UNUSED_PIN_LIST {}
 #ifdef MT7621_LED_STATUS1
