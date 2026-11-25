@@ -1,0 +1,44 @@
+name: build-max3-uboot
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'board/ralink/common/cmd_max3.c'
+      - 'configs/mt7621_max3_defconfig'
+      - 'max3_build.sh'
+      - '.github/workflows/max3.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装宿主依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bison flex bc uuid-dev libssl-dev \
+                                   xz-utils lzma python3 python-is-python3 wget
+          make --version | head -n1
+          gcc --version | head -n1
+
+      - name: 拉取 OpenWrt MT7621 工具链（仓库同款，gcc-12.3.0 musl）
+        run: |
+          mkdir -p tc
+          wget -q -O tc.tar.xz https://github.com/DragonBluep/uboot-mt7621/releases/download/20230517/openwrt-toolchain-ramips-mt7621_gcc-12.3.0_musl.Linux-x86_64.tar.xz
+          tar --xz -xf tc.tar.xz -C tc
+          ls tc
+
+      - name: 构建
+        run: |
+          TC=$(find tc -maxdepth 4 -name 'mipsel-openwrt-linux-gcc' | head -n1)
+          PREFIX="${TC%gcc}"
+          chmod +x max3_build.sh
+          ./max3_build.sh "$PREFIX"
+
+      - name: 归档产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: max3-uboot-lzma
+          path: dist/
