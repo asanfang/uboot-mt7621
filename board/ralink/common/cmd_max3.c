@@ -24,6 +24,19 @@
 #include <asm-generic/gpio.h>
 #include <stdarg.h>
 
+/*
+ * MAX3 板级 GPIO 表初始化，定义在 board/ralink/mt7621_nand_rfb/
+ * mt7621_nand_rfb.c。原厂是在打印 "max3 autoboot start" 之后才跑这张表，
+ * 因此这里的调用点就在 do_max3autoboot() 开头。
+ */
+extern void max3_gpio_init(void);
+
+/*
+ * 关闭外置看门狗（GPIO10）。56 秒窗口：任何 NAND 擦写或长时间救援
+ * 停留都必须先关，否则写入会被硬复位打断，留下半截镜像。
+ */
+extern int max3_wdt_disable(void);
+
 /* ---------------- 物理布局 ---------------- */
 #define M3_NAND_ERASE		0x20000UL
 #define M3_UBOOT_OFF		0x20000UL
@@ -63,7 +76,7 @@
 
 /* ---------------- LED 灯语 ----------------
  *
- * 三颗灯已在 last_stage_init 里 gpio_request + gpio_direction_output，
+ * 三颗灯已由 max3_gpio_init() 在 do_max3autoboot() 开头 request 并设定方向，
  * 这里只做 gpio_set_value。极性 ACTIVE_HIGH：1 = 亮。
  *
  * 静态编码（可以一直挂着看，重启前不变）：
@@ -203,6 +216,12 @@ static int m3_prog_src(ulong off, ulong erase_len, ulong size, ulong src,
 	char cmd[192];
 	ulong wlen = (size + 0x7FF) & ~0x7FFUL;
 	int ret;
+
+	/*
+	 * 写 NAND 前必须先关外置看门狗：单槽 7 MiB 含回读校验，
+	 * 56 秒窗口一旦越界就是硬复位 + 半截镜像。
+	 */
+	max3_wdt_disable();
 
 	/* 末页补 0xFF，否则 nand write 会因不足一页而报错 */
 	memset((void *)(src + size), 0xFF, wlen - size);
@@ -540,6 +559,9 @@ static void m3_httpd(void)
 {
 	m3_led_mode = 1;
 
+	/* 可能长时间停留（等 PC 连上、按分区连写），先关外置看门狗 */
+	max3_wdt_disable();
+
 	printf("\nMAX3: 进入网页救援（http://%s/max3 ，按分区写镜像）\n",
 	       env_get("ipaddr") ? env_get("ipaddr") : "192.168.1.1");
 
@@ -557,6 +579,9 @@ static void m3_tftploop(void)
 	ulong fs;
 
 	m3_led_mode = 2;
+
+	/* 循环等命令 + 按命令连写，可能长时间停留，先关外置看门狗 */
+	max3_wdt_disable();
 
 	printf("\nMAX3: 进入网口救援。PC 侧 ip=%s，反复 TFTP 取 max3.cmd\n",
 	       env_get("serverip") ? env_get("serverip") : "192.168.1.2");
@@ -682,6 +707,13 @@ static int do_max3autoboot(cmd_tbl_t *cmdtp, int flag, int argc,
 {
 	const char *slot;
 	int i, ret = -1;
+
+	/*
+	 * 与原厂时序一致：autoboot 入口先跑 GPIO 表（17 -> 11 高 -> 12 低 ->
+	 * 10 -> 9 -> 6 -> 5 -> LED）。必须早于下面的按键窗口：读 reset 键、
+	 * 翻转系统灯都依赖这些脚已 request 并设好方向。
+	 */
+	max3_gpio_init();
 
 	/* 默认值落盘一次：boot_slot=a，webwait 只是提示位 */
 	if (!env_get("boot_slot"))
