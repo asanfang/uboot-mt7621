@@ -53,6 +53,49 @@ jobs:
           echo "---- 日志末尾 ----"
           tail -n 40 build.log
 
+      - name: 生成可直接烧写的镜像（改名 + 补齐 0xFF）
+        run: |
+          python3 - <<'PY'
+          import os, struct, zlib, hashlib
+
+          NAME = b"U-Boot 2018.09 for mt7621_nand_r"
+          ALIGN = 2048
+          REGION = 0x40000
+
+          cands = ["dist/u-boot-lzma-v3.img", "dist/u-boot-lzma.img", "u-boot-lzma.img"]
+          src = next((p for p in cands if os.path.isfile(p)), None)
+          if src is None:
+              raise SystemExit("找不到 u-boot-lzma 产物")
+
+          d = bytearray(open(src, "rb").read())
+          if struct.unpack(">I", bytes(d[:4]))[0] != 0x27051956:
+              raise SystemExit("%s 不是 uImage" % src)
+
+          old = bytes(d[32:64]).decode("latin-1").rstrip()
+          d[32:64] = NAME + b"\x00" * (32 - len(NAME))
+          d[4:8] = b"\x00\x00\x00\x00"
+          d[4:8] = struct.pack(">I", zlib.crc32(bytes(d[:64])) & 0xFFFFFFFF)
+
+          size = struct.unpack(">I", bytes(d[12:16]))[0]
+          if len(d) < 64 + size:
+              raise SystemExit("data 区不足，头里 size=%d" % size)
+
+          pad = (-len(d)) % ALIGN
+          out = bytes(d) + b"\xff" * pad
+          if len(out) > REGION:
+              raise SystemExit("超出块 1-2 容量：%d > %d" % (len(out), REGION))
+
+          dst = "dist/u-boot-lzma-v3-named-pad.bin"
+          open(dst, "wb").write(out)
+
+          print("源     ", src)
+          print("name   ", old, "->", NAME.decode())
+          print("hcrc    0x%08X" % struct.unpack(">I", out[4:8])[0])
+          print("大小    %d B（补 %d B 0xFF）" % (len(out), pad))
+          print("页数    %d" % (len(out) // ALIGN))
+          print("sha256  %s" % hashlib.sha256(out).hexdigest())
+          PY
+
       - name: 归档产物
         if: always()
         uses: actions/upload-artifact@v4
