@@ -810,7 +810,7 @@ static void httpd_std_err_response(struct tcb_cb_data *cbd, u32 code)
 	pdata->response.info.code = code;
 	pdata->response.info.connection_close = 1;
 	pdata->response.info.content_length = pdata->response.size;
-	pdata->response.info.content_type = "text/html";
+	pdata->response.info.content_type = "text/html; charset=utf-8";
 
 	size = http_make_response_header(&pdata->response.info,
 	       pdata->buf,
