@@ -151,6 +151,43 @@ static void max3_mbb_smem_init(void)
 #ifdef CONFIG_LAST_STAGE_INIT
 int last_stage_init(void)
 {
+	/*
+	 * MAX3: 板级 GPIO 初始化，与原厂 U-Boot 的 max3_gpio_init 对齐
+	 * （载荷 0x8021B720，表 0x80244DEC：每项 enable|name|gpio|dir|level，
+	 *   步长 0x30，共 11 项）。11 项里只有 6 项 enable=1，其余 5 项是灯
+	 *   （en=0），原厂同样不设，交给应用层。
+	 *
+	 * 首步照搬原厂的 (*(u32 *)0xbe000060) |= 0x80：
+	 * 该地址是 SYSCTL 的 GPIO_MODE 寄存器，bit7 = JTAG_MODE。
+	 * 置 1 后 JTAG 引脚（13/15/16）才作为普通 GPIO 使用 ——
+	 * 这是下面读 strap、以及 max3_mbb_smem_init() 里
+	 * gpio_get_value(13/15/16) 取到真实电平的前提。
+	 */
+	void __iomem *sysctl = (void __iomem *)CKSEG1ADDR(MT7621_SYSCTL_BASE);
+
+	setbits_le32(sysctl + MT7621_SYS_GPIO_MODE_REG, 1 << JTAG_MODE_S);
+
+	/*
+	 * 本轮关键修复点：GPIO12 = usb20_vbus_ctrl。
+	 * 原厂每次 boot 都把它设成 output low；V5 此前完全不碰，
+	 * 引脚保持输入高阻（悬空）-> 5G 模块 USB VBUS 开关不受控 ->
+	 * 模块枚举被拖到 75s 之后 -> 撞上 mic 39.5s 判定窗 ->
+	 * [micdetmg]abnormal reboot -> 二次重启。
+	 */
+	gpio_output_init(12, 0, "usb20_vbus_ctrl");
+
+	/* 原厂表里其余 4 项，方向/电平原样照搬 */
+	gpio_output_init(9, 0, "m_fastboot_ctrl");
+	gpio_output_init(6, 1, "m_power_on_ctrl");
+	gpio_input_init(5, "m_rest_ctrl");
+	gpio_input_init(17, "m_pwr_ctrl");
+
+	/*
+	 * GPIO11(usb20_sw) 不在此重复设置：它同时是 MT7621_LED_STATUS1(sys_led)，
+	 * 下面的灯初始化会把它设成 output + ACTIVE_HIGH(1)，与原厂 usb20_sw
+	 * 的 output high 电平一致，无需再抢一次。
+	 */
+
 #ifdef MT7621_BUTTON_RESET
 	/*
 	 * MAX3: 关闭板载外置看门狗
