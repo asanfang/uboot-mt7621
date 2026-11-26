@@ -581,19 +581,119 @@ int misc_init_r(void)
 }
 #endif /* CONFIG_MISC_INIT_R */
 
+#ifndef CONFIG_SPL_BUILD	/* 仅 U-Boot proper：由 max3autoboot 命令入口调用 */
+
+/* 板载外置看门狗的复位/使能脚 */
+#define MAX3_WDT_GPIO		10
+
+/*
+ * 关闭板载外置看门狗。
+ *
+ * 该芯片上电后默认使能，约 56 秒无喂狗即硬复位。这会打断 max3flash /
+ * max3uboot 的 NAND 写入（单槽 7 MiB，含回读校验），写到一半被打断
+ * 会留下半截镜像 —— 这是绝对不能出现的。
+ *
+ * 因此它不能挂在下面的"表序循环"里：循环遇到 request/direction 失败
+ * 就 break，排在它前面的 17/11/12 任何一项失败都会让它被跳过。
+ * 独立成函数、幂等、失败可重试，并在每个擦写/救援入口先执行一次。
+ *
+ * 实测：pin10 高=使能、低=禁用；拉低后 sleep 60 不再复位。
+ * Linux 侧应用启动后会自行重新使能并喂狗，不受影响。
+ */
+int max3_wdt_disable(void)
+{
+	int ret;
+
+	ret = gpio_request(MAX3_WDT_GPIO, "wdt_set");
+	if (ret && ret != -EBUSY)
+		return ret;			/* 只容忍已占用，其它错误上报 */
+
+	gpio_direction_output(MAX3_WDT_GPIO, 0);
+	gpio_set_value(MAX3_WDT_GPIO, 0);
+
+	return 0;
+}
+
+/*
+ * MAX3 板级 GPIO 表。
+ *
+ * 字段与布局对齐原厂 max3_gpio_init 所用的表（原有表 @0x80244DEC、
+ * 步长 0x30、11 项，字段 enable/name/gpio/dir/level）：enable 决定做不做，
+ * dir==1 表示输出并取 level，dir==0 表示输入。执行方式同为"按表序逐项执行"。
+ *
+ * 本表只列出本板真正要执行的动作。原厂表中 enable=0 的
+ * max3_gpio_wdt_set(10) / m_nr_led_green(24) / m_lte_led_green(22) /
+ * m_warm_test_led(26) / ap_led(27) 原厂一律跳过，这里同样不碰。
+ * 其中 GPIO10（外置看门狗）改由独立的 max3_wdt_disable() 强制关闭，
+ * 不放进这张表 —— 理由见该函数注释。
+ *
+ * 顺序即执行顺序，必须与原厂表序一致 —— 尤其 usb20_sw(11) 必须先于
+ * usb20_vbus_ctrl(12)：原厂是"先把 USB2 通道选通、再控 VBUS"。
+ */
+struct max3_gpio_cfg {
+	int enable;
+	const char *name;
+	int gpio;
+	int dir;
+	int level;
+};
+
+static const struct max3_gpio_cfg max3_gpio_table[] = {
+	/* 0 */ { 1, "max3_gpio_m_pwr_ctrl",        17, 0, 0 },
+	/* 1 */ { 1, "max3_gpio_usb20_sw",          11, 1, 1 },
+	/* 2 */ { 1, "max3_gpio_usb20_vbus_ctrl",   12, 1, 0 },
+	/* 3 */ /* 原厂第 3 项 wdt_set(10)：改由 max3_wdt_disable() 独立强制关闭 */
+	/* 4 */ { 1, "max3_gpio_m_fastboot_ctrl",    9, 1, 0 },
+	/* 5 */ { 1, "max3_gpio_m_power_on_ctrl",    6, 1, 1 },
+	/* 6 */ { 1, "max3_gpio_m_rest_ctrl",        5, 0, 0 },
+	/* 7 */ { 1, "max3_gpio_led_lte",            3, 1, 0 },
+	/* 8 */ { 1, "max3_gpio_led_nr",             4, 1, 0 },
+};
+
+/*
+ * 表驱动初始化。与原厂循环等价：enable != 1 直接跳过；
+ * 输出型走 gpio_direction_output(gpio, level)，输入型走 gpio_direction_input。
+ * gpio_output_init()/gpio_input_init() 内部已做 request 与 -EBUSY 容忍。
+ *
+ * 非 static：调用点已移到 max3autoboot 命令入口（cmd_max3.c），
+ * 与原厂"先打印 max3 autoboot start、再执行表"的时序一致。
+ */
+void max3_gpio_init(void)
+{
+	const struct max3_gpio_cfg *cfg = max3_gpio_table;
+	unsigned int i, n = sizeof(max3_gpio_table) / sizeof(max3_gpio_table[0]);
+
+	/* 看门狗先行关闭：不受下面循环 break 的影响 */
+	max3_wdt_disable();
+
+	for (i = 0; i < n; i++, cfg++) {
+		if (cfg->enable != 1)
+			continue;
+
+		if (cfg->dir == 1) {
+			if (gpio_output_init(cfg->gpio, cfg->level, cfg->name))
+				break;
+		} else {
+			if (gpio_input_init(cfg->gpio, cfg->name))
+				break;
+		}
+	}
+}
+
+#endif /* !CONFIG_SPL_BUILD */
+
 #ifdef CONFIG_LAST_STAGE_INIT
+
 int last_stage_init(void)
 {
 	/*
-	 * MAX3: 板级 GPIO 初始化，与原厂 U-Boot 的 max3_gpio_init 对齐
-	 * （载荷 0x8021B720，表 0x80244DEC：每项 enable|name|gpio|dir|level，
-	 *   步长 0x30，共 11 项）。11 项里只有 6 项 enable=1，其余 5 项是灯
-	 *   （en=0），原厂同样不设，交给应用层。
+	 * MAX3: GPIO 表已移到 max3autoboot 命令入口（cmd_max3.c 的
+	 * do_max3autoboot），时序与原厂一致 —— 原厂也是先打印
+	 * "max3 autoboot start"，再执行那张 11 项表。
 	 *
-	 * 首步照搬原厂的 (*(u32 *)0xbe000060) |= 0x80：
-	 * 该地址是 SYSCTL 的 GPIO_MODE 寄存器，bit7 = JTAG_MODE。
-	 * 置 1 后 JTAG 引脚（13/15/16）才作为普通 GPIO 使用 ——
-	 * 这是下面读 strap、以及 max3_mbb_smem_init() 里
+	 * 这里只保留 JTAG_MODE 置位：该地址是 SYSCTL 的 GPIO_MODE 寄存器，
+	 * bit7 = JTAG_MODE。置 1 后 JTAG 引脚（13/15/16）才作为普通 GPIO
+	 * 使用 —— 这是下面读 strap、以及 max3_mbb_smem_init() 里
 	 * gpio_get_value(13/15/16) 取到真实电平的前提。
 	 */
 	void __iomem *sysctl = (void __iomem *)CKSEG1ADDR(MT7621_SYSCTL_BASE);
@@ -601,41 +701,12 @@ int last_stage_init(void)
 	setbits_le32(sysctl + MT7621_SYS_GPIO_MODE_REG, 1 << JTAG_MODE_S);
 
 	/*
-	 * 本轮关键修复点：GPIO12 = usb20_vbus_ctrl。
-	 * 原厂每次 boot 都把它设成 output low；V5 此前完全不碰，
-	 * 引脚保持输入高阻（悬空）-> 5G 模块 USB VBUS 开关不受控 ->
-	 * 模块枚举被拖到 75s 之后 -> 撞上 mic 39.5s 判定窗 ->
-	 * [micdetmg]abnormal reboot -> 二次重启。
+	 * GPIO 表不在此处执行：已移到 do_max3autoboot()（cmd_max3.c），
+	 * 以对齐原厂"autoboot 之后才设定 11/12"的时序。
+	 * 表内顺序：17(输入) -> 11(输出高 usb20_sw) -> 12(输出低 vbus)
+	 *   -> 9 -> 6 -> 5 -> LED(3/4)；外置看门狗(10) 不在此表，
+	 *   由 max3_wdt_disable() 在表之前单独关闭。
 	 */
-	gpio_output_init(12, 0, "usb20_vbus_ctrl");
-
-	/* 原厂表里其余 4 项，方向/电平原样照搬 */
-	gpio_output_init(9, 0, "m_fastboot_ctrl");
-	gpio_output_init(6, 1, "m_power_on_ctrl");
-	gpio_input_init(5, "m_rest_ctrl");
-	gpio_input_init(17, "m_pwr_ctrl");
-
-	/*
-	 * GPIO11(usb20_sw) 不在此重复设置：它同时是 MT7621_LED_STATUS1(sys_led)，
-	 * 下面的灯初始化会把它设成 output + ACTIVE_HIGH(1)，与原厂 usb20_sw
-	 * 的 output high 电平一致，无需再抢一次。
-	 */
-
-#ifdef MT7621_BUTTON_RESET
-	/*
-	 * MAX3: 关闭板载外置看门狗
-	 *
-	 * 原厂 U-Boot 在 GPIO0(wdt_di)/GPIO10(wdt_set) 上控制一颗外置看门狗，
-	 * 复位后默认使能，约 56 秒无喂狗即硬复位。这会让 console 停留、
-	 * httpd/tftploop 网页救援、按分区刷写等长操作中途被打断。
-	 *
-	 * 实测：gpio clear 10 -> "mt7621-gpio10: output: 0"，sleep 60 不再复位，
-	 * 确认 pin10 高=使能、低=禁用。此处在进入命令行之前关闭，
-	 * 之后 U-Boot 全程不再受 56 秒窗口约束。
-	 * Linux 侧原厂应用启动后会自行重新使能并喂狗，不受影响。
-	 */
-	gpio_output_init(10, 0, "wdt_set");
-#endif
 
 #if defined(CONFIG_BOARD_MT7621_NAND_TEMPLATE)
 	#define MT7621_UNUSED_PIN_LIST {}
@@ -643,19 +714,9 @@ int last_stage_init(void)
 	gpio_input_init(MT7621_BUTTON_RESET, "button-reset");	// init button reset
 #endif
 	/*
-	 * 三颗灯上电即定态：系统灯常亮（电源/存活指示），lte/nr 灭。
-	 * 注意极性：ACTIVE_HIGH(1) 才是亮，原厂模板这里写的 0 是灭，
-	 * 直接照抄会得到"上电全黑"，已按实测极性修正。
+	 * 三颗灯已并入 max3_gpio_table（11=led-sys 常亮、3=led-lte 灭、
+	 * 4=led-nr 灭），此处不再重复申请，避免同一脚被 request 两次。
 	 */
-#ifdef MT7621_LED_STATUS1
-	gpio_output_init(MT7621_LED_STATUS1, MT7621_LED_ACTIVE_HIGH, "led-sys");
-#endif
-#ifdef MT7621_LED_STATUS2
-	gpio_output_init(MT7621_LED_STATUS2, !MT7621_LED_ACTIVE_HIGH, "led-lte");
-#endif
-#ifdef MT7621_LED_STATUS3
-	gpio_output_init(MT7621_LED_STATUS3, !MT7621_LED_ACTIVE_HIGH, "led-nr");
-#endif
 #else
 	#define MT7621_UNUSED_PIN_LIST {}
 #endif
