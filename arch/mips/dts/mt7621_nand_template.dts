@@ -65,5 +65,11 @@
 };
 
 &xhci {
-	status = "okay";
+	/* 对齐原厂 U-Boot stage2 内置 DTB（文件偏移 0x04B4B0，total=0xE12）：
+	 * 原厂 xhci@1e1c0000 为 status="disabled"，U-Boot 不初始化 USB 控制器，
+	 * 把 USB PHY / XHCI 的初始状态完整交给内核（内核用 boot 分区自己的 DTB）。
+	 * 本自建 U-Boot 未编入任何 CONFIG_USB_* 驱动（u-boot.map 无 xhci/usb_ 符号），
+	 * 这里的 status 只影响 DTB 内容本身，不影响 U-Boot 运行时行为。
+	 */
+	status = "disabled";
 };
