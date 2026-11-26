@@ -46,7 +46,7 @@ static int output_plain_file(struct httpd_response *response,
 
 	response->info.code = 200;
 	response->info.connection_close = 1;
-	response->info.content_type = "text/html";
+	response->info.content_type = "text/html; charset=utf-8";
 
 	return ret;
 }
@@ -186,7 +186,7 @@ static void result_handler(enum httpd_uri_handler_status status,
 		response->info.http_1_0 = 1;
 		response->info.content_length = -1;
 		response->info.connection_close = 1;
-		response->info.content_type = "text/html";
+		response->info.content_type = "text/html; charset=utf-8";
 		response->info.code = 200;
 
 		size = http_make_response_header(&response->info,
@@ -313,7 +313,7 @@ static void max3flash_handler(enum httpd_uri_handler_status status,
 			response->data = "missing target or file";
 			response->size = strlen(response->data);
 			response->info.code = 400;
-			response->info.content_type = "text/html";
+			response->info.content_type = "text/html; charset=utf-8";
 			response->info.connection_close = 1;
 			return;
 		}
@@ -327,7 +327,7 @@ static void max3flash_handler(enum httpd_uri_handler_status status,
 		response->info.http_1_0 = 1;
 		response->info.content_length = -1;
 		response->info.connection_close = 1;
-		response->info.content_type = "text/html";
+		response->info.content_type = "text/html; charset=utf-8";
 		response->info.code = 200;
 
 		hdr = http_make_response_header(&response->info, st->body,
@@ -407,7 +407,7 @@ static void max3slot_handler(enum httpd_uri_handler_status status,
 	response->status = HTTP_RESP_STD;
 	response->data = msg;
 	response->size = strlen(msg);
-	response->info.content_type = "text/html";
+	response->info.content_type = "text/html; charset=utf-8";
 	response->info.connection_close = 1;
 }
 
