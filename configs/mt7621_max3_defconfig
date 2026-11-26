@@ -41,6 +41,8 @@ CONFIG_OF_CONTROL=y
 CONFIG_OF_EMBED=y
 CONFIG_DEFAULT_DEVICE_TREE="mt7621_nand_template"
 CONFIG_NET_RANDOM_ETHADDR=y
+# MAX3: 需要 misc_init_r 在 initr_net 之前从 NV 区读出 SN/MAC 并固化到 env
+CONFIG_MISC_INIT_R=y
 # CONFIG_DM_WARN is not set
 # CONFIG_OF_TRANSLATE is not set
 CONFIG_DM_GPIO=y
