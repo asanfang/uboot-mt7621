@@ -20,6 +20,8 @@
 
 #include <nmbm/nmbm.h>
 #include <nmbm/nmbm-mtd.h>
+#include <linux/string.h>
+#include <malloc.h>
 
 #ifdef CONFIG_ENABLE_NAND_NMBM
 static int nmbm_usable;
@@ -148,6 +150,437 @@ static void max3_mbb_smem_init(void)
 }
 #endif
 
+/*
+ * 注意：mtk_board_get_flash_dev()/mtk_board_flash_read() 定义在下面的
+ * #ifndef CONFIG_SPL_BUILD 里，SPL 阶段没有这两个符号，所以本块也必须
+ * 排除 SPL 构建；另外 misc_init_r() 只有 U-Boot 主镜像会调用。
+ */
+#if defined(CONFIG_MISC_INIT_R) && !defined(CONFIG_SPL_BUILD)
+/*
+ * ---------- MAX3: 从 NV(mnv) 区读 SN / MAC，并固化到 U-Boot env ----------
+ *
+ * 记录格式（2026-11-26 用 mtd05/06/07 裸备份逐字节实测 + 全量重扫校准）：
+ *
+ *   [magic-0x1C .. magic-0x01]  28 B 记录头
+ *       +0x00 u32 sig      = 5C B6 0A 02   <- 真记录的签名；payload 内部还会
+ *                                            嵌一个假 "FDNM"，靠这个区分
+ *       +0x04 u32 ver      = 0100 0100
+ *       +0x0C u32 idx      槽号，同一条记录写多份就靠它区分
+ *       +0x10 u32 id       = 47 (0x2F)  <- 设备身份记录的类型号
+ *       +0x14 u32 size     = 228 (0xE4) <- payload 长度（旧代码误取成 47）
+ *       +0x18 u32 seq
+ *   [magic+0x00 .. magic+0x1F]  32 B 记录摘要（"FDNM" 4 字节 + 28 B 校验）
+ *   [magic+0x20 .. magic+0xE3]  228 B payload：
+ *       +0x00 4 x 12 位大写 ASCII MAC（连写、无分隔符）
+ *             实测 D0A0D663247C / D0A0D663E7CC / D0A0D6619DDD / D0A0D662612D
+ *             依次对应：无接口(预留) / eth0 / wlan0 / wlan1
+ *       +0x30 32 B = sha256(payload[0x00..0x30])，三份 nv 全部吻合
+ *       +0x50 32 B 全 0 保留
+ *       +0x70 32 B 校验
+ *       +0x90 4 B 标记 + 16 B ASCII SN（实测 fc 3c 8a 0e | CPE5G54121000467）
+ *       +0xA4 4 B 0xFF 结束符
+ *       +0xA8 32 B 校验
+ *
+ * 同一条记录在三个 nv 分区里会重复多份（默认镜像 2 份、备份 4 份、产测 3 份），
+ * 且各分区取值完全一致 —— 这就是天然的多份互校，无需再校验摘要。
+ *
+ * 分区偏移来自 CONFIG_MTDPARTS_DEFAULT：
+ *   uboot 1M / boot 10M / bootbk 10M / oeminfo 1536K / mnvdload 1M /
+ *   mnvbackup 1M(0x1780000) / mnvdefault 1M(0x1880000) / mnvimg 10M(0x1980000)
+ */
+#define MAX3_OEMINFO_OFF	0x1500000UL
+#define MAX3_MNV_BACKUP_OFF	0x1780000UL
+#define MAX3_MNV_DEFAULT_OFF	0x1880000UL
+#define MAX3_MNV_IMG_OFF	0x1980000UL
+#define MAX3_MNV_SCAN_LEN	0x80000UL	/* 每处扫 512 KiB，覆盖上述命中点 */
+#define MAX3_MNV_REC_HDR	0x1CU		/* magic 前的 28 B 结构头 */
+#define MAX3_MNV_REC_CHECK	0x20U		/* magic 后的 32 B 摘要 */
+#define MAX3_MNV_REC_ID		47U		/* 设备身份记录的类型号 */
+#define MAX3_MNV_REC_SIZE	0xE4U		/* payload 长度，228 B */
+#define MAX3_MAC_NUM		4		/* 一条记录带 4 个 MAC */
+#define MAX3_MAC_GRP		4		/* 一个区里最多记 4 组不同候选 */
+#define MAX3_SN_OFF_MIN		0x50U		/* payload 里 SN 滑窗起点 */
+
+/*
+ * U-Boot 自己走的是 eth0（MT7621 的 GMAC0），所以默认取记录里第 2 个 MAC
+ * （实测它正是 Linux 侧 eth0 的值）。要换用别的槽改这里即可：
+ *   0 = 预留/无接口   1 = eth0   2 = wlan0   3 = wlan1
+ */
+#ifndef MAX3_U_BOOT_MAC_IDX
+#define MAX3_U_BOOT_MAC_IDX	1
+#endif
+#if MAX3_U_BOOT_MAC_IDX >= MAX3_MAC_NUM
+#error "MAX3_U_BOOT_MAC_IDX 超出 MAX3_MAC_NUM"
+#endif
+
+void *mtk_board_get_flash_dev(void);
+int mtk_board_flash_read(void *flashdev, uint64_t offset, size_t len,
+			 void *buf);
+
+static int max3_hexval(char c)
+{
+	if (c >= '0' && c <= '9')
+		return c - '0';
+	if (c >= 'a' && c <= 'f')
+		return c - 'a' + 10;
+	if (c >= 'A' && c <= 'F')
+		return c - 'A' + 10;
+
+	return -1;
+}
+
+/* "aa:bb:cc:dd:ee:ff" -> 6 字节；格式不对返回 -1（不依赖 <net.h>） */
+static int max3_parse_mac(const char *s, u8 *mac)
+{
+	int i;
+
+	if (!s)
+		return -1;
+
+	for (i = 0; i < 6; i++) {
+		int h, l;
+
+		h = max3_hexval(s[0]);
+		l = (h < 0) ? -1 : max3_hexval(s[1]);
+		if (h < 0 || l < 0)
+			return -1;
+
+		mac[i] = (u8)((h << 4) | l);
+		s += 2;
+
+		if (i < 5) {
+			if (*s != ':' && *s != '-')
+				return -1;
+			s++;
+		}
+	}
+
+	return 0;
+}
+
+static int max3_is_alnum(u8 c)
+{
+	return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+	       (c >= 'a' && c <= 'z');
+}
+
+/* payload 里 12 字节是不是 12 位十六进制（实测一律大写，这里两种都收） */
+static int max3_mac_field_ok(const u8 *b, size_t off)
+{
+	int k;
+
+	for (k = 0; k < 12; k++)
+		if (max3_hexval((char)b[off + k]) < 0)
+			return 0;
+
+	return 1;
+}
+
+/* 12 位 ASCII -> 6 字节 */
+static void max3_mac_decode(const u8 *p, u8 *out)
+{
+	int k;
+
+	for (k = 0; k < 6; k++)
+		out[k] = (u8)((max3_hexval((char)p[2 * k]) << 4) |
+			      max3_hexval((char)p[2 * k + 1]));
+}
+
+/*
+ * payload 偏移 off 处的 16 字节是不是 SN：
+ * 纯字母数字、至少 4 个数字、且前后都不接字母数字（防止从长串里截一段）。
+ */
+static int max3_sn_at(const u8 *p, size_t len, size_t off, char *out)
+{
+	int k, dig = 0;
+
+	if (off + 16 > len)
+		return 0;
+	if (off > 0 && max3_is_alnum(p[off - 1]))
+		return 0;
+	if (off + 16 < len && max3_is_alnum(p[off + 16]))
+		return 0;
+
+	for (k = 0; k < 16; k++) {
+		u8 c = p[off + k];
+
+		if (!max3_is_alnum(c))
+			return 0;
+		if (c >= '0' && c <= '9')
+			dig++;
+	}
+	if (dig < 4)
+		return 0;
+
+	memcpy(out, p + off, 16);
+	out[16] = '\0';
+
+	return 1;
+}
+
+/*
+ * 扫一个 512 KiB 窗口，找 id=47 / size=228 的设备身份记录。
+ * 输出该区里出现次数最多的那一组 4 个 MAC（macs[0..3][6]），票数进 *hits，
+ * SN 进 sn。一条都没命中时 *hits = 0。
+ */
+static void max3_mnv_scan(const u8 *buf, size_t len, u8 macs[][6], int *hits,
+			  char *sn, size_t snsz)
+{
+	static u8 g_mac[MAX3_MAC_GRP][MAX3_MAC_NUM][6];
+	static int g_cnt[MAX3_MAC_GRP];
+	size_t i;
+	int ng = 0, g, k, best = 0;
+
+	*hits = 0;
+	for (k = 0; k < MAX3_MAC_NUM; k++)
+		memset(macs[k], 0, 6);
+	if (sn && snsz)
+		sn[0] = '\0';
+
+	memset(g_mac, 0, sizeof(g_mac));
+	memset(g_cnt, 0, sizeof(g_cnt));
+
+	for (i = MAX3_MNV_REC_HDR; i + MAX3_MNV_REC_CHECK <= len; i++) {
+		u32 rid, sz;
+		const u8 *p;
+		u8 f[MAX3_MAC_NUM][6];
+		int ok = 1;
+
+		if (buf[i] != 'F' || buf[i + 1] != 'D' ||
+		    buf[i + 2] != 'N' || buf[i + 3] != 'M')
+			continue;
+
+		/* 真记录前面必有 sig；payload 里嵌的那个 "FDNM" 没有，跳过 */
+		if (memcmp(buf + i - MAX3_MNV_REC_HDR,
+			   "\x5c\xb6\x0a\x02", 4))
+			continue;
+
+		rid = (u32)buf[i - 0x0C] | ((u32)buf[i - 0x0B] << 8) |
+		      ((u32)buf[i - 0x0A] << 16) | ((u32)buf[i - 0x09] << 24);
+		sz  = (u32)buf[i - 0x08] | ((u32)buf[i - 0x07] << 8) |
+		      ((u32)buf[i - 0x06] << 16) | ((u32)buf[i - 0x05] << 24);
+
+		if (rid != MAX3_MNV_REC_ID || sz < MAX3_MNV_REC_SIZE)
+			continue;
+
+		if (i + MAX3_MNV_REC_CHECK + MAX3_MNV_REC_SIZE > len)
+			continue;
+
+		p = buf + i + MAX3_MNV_REC_CHECK;
+
+		/* 4 个 12 位 MAC 连写，且必须同 OUI，否则不当身份记录 */
+		for (k = 0; k < MAX3_MAC_NUM; k++) {
+			if (!max3_mac_field_ok(p, 12 * k)) {
+				ok = 0;
+				break;
+			}
+			max3_mac_decode(p + 12 * k, f[k]);
+		}
+
+		if (ok && !memcmp(f[0], f[1], 3) && !memcmp(f[1], f[2], 3) &&
+		    !memcmp(f[2], f[3], 3)) {
+			for (g = 0; g < ng; g++)
+				if (!memcmp(g_mac[g], f, sizeof(f)))
+					break;
+			if (g < ng) {
+				g_cnt[g]++;
+			} else if (ng < MAX3_MAC_GRP) {
+				memcpy(g_mac[ng], f, sizeof(f));
+				g_cnt[ng] = 1;
+				ng++;
+			}
+		}
+
+		/* SN：payload 中段滑窗，取第一个形态合格的串 */
+		if (sn && snsz >= 17 && !sn[0]) {
+			size_t j;
+
+			for (j = MAX3_SN_OFF_MIN;
+			     j + 16 <= MAX3_MNV_REC_SIZE; j++) {
+				if (max3_sn_at(p, MAX3_MNV_REC_SIZE, j, sn))
+					break;
+			}
+		}
+	}
+
+	for (g = 0; g < ng; g++) {
+		if (g_cnt[g] > best) {
+			best = g_cnt[g];
+			for (k = 0; k < MAX3_MAC_NUM; k++)
+				memcpy(macs[k], g_mac[g][k], 6);
+		}
+	}
+	*hits = best;
+}
+
+static int max3_env_ids(void)
+{
+	static const u32 areas[] = {
+		MAX3_MNV_DEFAULT_OFF, MAX3_MNV_BACKUP_OFF,
+		MAX3_MNV_IMG_OFF, MAX3_OEMINFO_OFF
+	};
+	u8 *buf;
+	u8 mac[6];
+	int i, mac_hits = 0, need_save = 0, ret;
+	u32 where = 0;
+	char sn[20] = { 0 };
+	char macstr[20] = { 0 };
+	void *dev;
+
+	/* 三项都固化过就不再读闪存，也不重复写 env */
+	if (env_get("ethaddr") && env_get("eth1addr") && env_get("serial#"))
+		return 0;
+
+	dev = mtk_board_get_flash_dev();
+	if (!dev) {
+		printf("MAX3: 取不到 NAND 设备，跳过 SN/MAC 读取\n");
+		return 0;
+	}
+
+	buf = malloc(MAX3_MNV_SCAN_LEN);
+	if (!buf) {
+		printf("MAX3: 分配 %u KiB 缓冲失败，跳过 SN/MAC 读取\n",
+		       (unsigned)(MAX3_MNV_SCAN_LEN >> 10));
+		return 0;
+	}
+
+	memset(mac, 0, sizeof(mac));
+
+	for (i = 0; i < (int)(sizeof(areas) / sizeof(areas[0])); i++) {
+		u8 m2[MAX3_MAC_NUM][6];
+		int h2 = 0, k;
+		char s2[20] = { 0 };
+
+		memset(m2, 0, sizeof(m2));
+
+		if (mtk_board_flash_read(dev, areas[i], MAX3_MNV_SCAN_LEN, buf)) {
+			printf("MAX3: 读 NV 区 0x%08x 失败\n", (unsigned)areas[i]);
+			continue;
+		}
+
+		max3_mnv_scan(buf, MAX3_MNV_SCAN_LEN, m2, &h2, s2, sizeof(s2));
+
+		if (h2 > 0) {
+			char tmp[80];
+			int n = 0;
+
+			for (k = 0; k < MAX3_MAC_NUM; k++)
+				n += sprintf(tmp + n,
+					     "%s%02x:%02x:%02x:%02x:%02x:%02x",
+					     k ? " " : "",
+					     m2[k][0], m2[k][1], m2[k][2],
+					     m2[k][3], m2[k][4], m2[k][5]);
+			printf("MAX3: NV 0x%08x 命中 %d 份，4 个 MAC = %s\n",
+			       (unsigned)areas[i], h2, tmp);
+		}
+
+		if (h2 > mac_hits) {
+			mac_hits = h2;
+			memcpy(mac, m2[MAX3_U_BOOT_MAC_IDX], 6);
+			where = areas[i];
+		}
+		if (!sn[0] && s2[0])
+			memcpy(sn, s2, sizeof(sn));
+
+		/* MAC 至少两处一致 + SN 都拿到，就够可信，不再多读 */
+		if (mac_hits >= 2 && sn[0])
+			break;
+	}
+
+	free(buf);
+
+	if (mac_hits) {
+		sprintf(macstr, "%02x:%02x:%02x:%02x:%02x:%02x",
+			mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+		printf("MAX3: 从 NV(0x%08x) 读出 MAC %s（命中 %d 份）\n",
+		       (unsigned)where, macstr, mac_hits);
+
+		if (!env_get("ethaddr")) {
+			env_set("ethaddr", macstr);
+			need_save = 1;
+		} else if (strcmp(env_get("ethaddr"), macstr)) {
+			printf("MAX3: env 已有 ethaddr=%s，与 NV 不同，保留 env（要覆盖请先 env delete ethaddr）\n",
+			       env_get("ethaddr"));
+		}
+	} else {
+		printf("MAX3: NV 区里没找到可信 MAC，保持现状\n");
+	}
+
+	if (sn[0]) {
+		printf("MAX3: 从 NV 读出 SN %s\n", sn);
+		if (!env_get("serial#")) {
+			env_set("serial#", sn);
+			need_save = 1;
+		} else if (strcmp(env_get("serial#"), sn)) {
+			printf("MAX3: env 已有 serial#=%s，与 NV 不同，保留 env\n",
+			       env_get("serial#"));
+		}
+	} else {
+		printf("MAX3: NV 区里没找到 SN，保持现状\n");
+	}
+
+	/*
+	 * 第二网口 eth1addr = 第一 MAC + 1。
+	 * 基准 MAC 优先取 env 里生效的 ethaddr（保证 eth0/eth1 始终同芯片连号），
+	 * env 没有或格式不合法时才退回 NV 读出的值。
+	 * 进位按整 6 字节处理：...:4b:ff + 1 -> ...:4c:00。
+	 */
+	{
+		u8 m2[6];
+		char s2[20];
+		const char *ea = env_get("ethaddr");
+		int have = 0;
+
+		if (ea && max3_parse_mac(ea, m2) == 0) {
+			have = 1;
+		} else if (mac_hits) {
+			memcpy(m2, mac, 6);
+			have = 1;
+		}
+
+		if (have) {
+			for (i = 5; i >= 0; i--)
+				if (++m2[i])
+					break;
+
+			sprintf(s2, "%02x:%02x:%02x:%02x:%02x:%02x",
+				m2[0], m2[1], m2[2], m2[3], m2[4], m2[5]);
+			printf("MAX3: 第二网口 eth1addr = %s（第一 MAC +1）\n", s2);
+
+			if (!env_get("eth1addr")) {
+				env_set("eth1addr", s2);
+				need_save = 1;
+			} else if (strcmp(env_get("eth1addr"), s2)) {
+				printf("MAX3: env 已有 eth1addr=%s，与推算值不同，保留 env\n",
+				       env_get("eth1addr"));
+			}
+		}
+	}
+
+	if (need_save) {
+		ret = env_save();
+		if (ret)
+			printf("MAX3: SN/MAC 写入 env 失败(%d)，下次启动会重试\n", ret);
+		else
+			printf("MAX3: SN/MAC 已固化到 U-Boot env\n");
+	}
+
+	return 0;
+}
+
+/*
+ * misc_init_r 在 initr_env 之后、initr_net 之前执行（common/board_r.c 里
+ * initr_env=778 行、misc_init_r=808 行、initr_net=840 行），
+ * 所以这里设好 ethaddr，**本次启动的网络初始化就直接用真实 MAC**，
+ * 不用等下一次。
+ */
+int misc_init_r(void)
+{
+	max3_env_ids();
+	return 0;
+}
+#endif /* CONFIG_MISC_INIT_R */
+
 #ifdef CONFIG_LAST_STAGE_INIT
 int last_stage_init(void)
 {
@@ -193,12 +626,12 @@ int last_stage_init(void)
 	 * MAX3: 关闭板载外置看门狗
 	 *
 	 * 原厂 U-Boot 在 GPIO0(wdt_di)/GPIO10(wdt_set) 上控制一颗外置看门狗，
-	 * 复位后默认使能，约 46 秒无喂狗即硬复位。这会让 console 停留、
+	 * 复位后默认使能，约 56 秒无喂狗即硬复位。这会让 console 停留、
 	 * httpd/tftploop 网页救援、按分区刷写等长操作中途被打断。
 	 *
 	 * 实测：gpio clear 10 -> "mt7621-gpio10: output: 0"，sleep 60 不再复位，
 	 * 确认 pin10 高=使能、低=禁用。此处在进入命令行之前关闭，
-	 * 之后 U-Boot 全程不再受 46 秒窗口约束。
+	 * 之后 U-Boot 全程不再受 56 秒窗口约束。
 	 * Linux 侧原厂应用启动后会自行重新使能并喂狗，不受影响。
 	 */
 	gpio_output_init(10, 0, "wdt_set");
