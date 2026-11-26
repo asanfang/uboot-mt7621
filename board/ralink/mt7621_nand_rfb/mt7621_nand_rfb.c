@@ -62,7 +62,12 @@ static int pins_unused_init(const int *pinlist, unsigned listsize)
 	char label[10] = "";
 
 	for (cnt = 0; cnt < listsize; cnt ++) {
-		if (cnt < 0 || cnt > 48) {
+		/*
+		 * 原厂这里判的是下标 cnt 而不是 pinlist[cnt]，等于用错边界：
+		 * 列表长度为 1 时永远通过，真给一个越界 pin 也拦不住。
+		 * MT7621 可用 GPIO 是 0..#61（pin group 表最大到 esw int = 61）。
+		 */
+		if (pinlist[cnt] < 0 || pinlist[cnt] > 61) {
 			printf("unsupported GPIO: gpio#%d", pinlist[cnt]);
 			return -1;
 		}
@@ -74,6 +79,74 @@ static int pins_unused_init(const int *pinlist, unsigned listsize)
 
 	return 0;
 }
+
+#ifdef MT7621_MBB_SMEM_PHYS
+/*
+ * MAX3：MBB（5G 模组 IC5980）共享内存初始化
+ *
+ * 原厂 U-Boot（mtd0 载荷 0x8021B208..0x8021B250）在进命令行前做两件事：
+ *   1) 读 strap GPIO13/15/16，组合成硬件 ID：(v13<<2)|(v15<<1)|v16；
+ *   2) 把该 ID 以 32 位写到 0xa0a00060（物理 0x00A00060 的非缓存视图）。
+ *
+ * Linux 侧 mbb_kernel_version.ko 的 bsp_get_hardware_id() 就是
+ *   get_msmem_addr() -> lw $v0, 0x60($v0) -> jr $ra
+ * 没有任何兜底。这块没写，g_product_id 就是上电随机值（现场实测 255），
+ * mbb_dload.ko 拿它去 product_info_st 里查表匹配失败 -> init 内部报错 ->
+ * 内核回滚该模块 -> mbb_nand / factory_at_interface 缺导出符号无法加载 ->
+ * /dev/at_exec 不存在 -> 上层 libapcmdproc.so 全线 "file hander = -1"。
+ *
+ * 本函数只补最小集：+0x60 硬件 ID。其余字段（+0x48 状态字、各 flag）实测
+ * 在残留垃圾值下三个模块也能依次 insmod 成功，不动以免误伤 dload /
+ * 多机升级等原厂分支。仅在判定"整块从未被写过"（+0x60 高 24 位非 0）时，
+ * 才按原厂冷启动语义把前 0x90 字节清零。
+ *
+ * 幂等：写完后 +0x60 高 24 位为 0，下次启动不会再清零。
+ */
+static void max3_mbb_smem_init(void)
+{
+	volatile u32 *smem = (volatile u32 *)MT7621_MBB_SMEM_CKSEG1;
+	u32 cur, id;
+	int b13, b15, b16, i;
+
+	/*
+	 * strap 三个脚要先 request 成输入再读，否则 gpio_get_value() 拿不到值。
+	 * pin13/15/16 属 "jtag" 组，模板 DTS 已把 jtag 设为 gpio 功能。
+	 */
+	gpio_input_init(13, "mbb-id13");
+	gpio_input_init(15, "mbb-id15");
+	gpio_input_init(16, "mbb-id16");
+
+	b13 = gpio_get_value(13) ? 1 : 0;
+	b15 = gpio_get_value(15) ? 1 : 0;
+	b16 = gpio_get_value(16) ? 1 : 0;
+	id = (u32)((b13 << 2) | (b15 << 1) | b16);
+
+	/* 产品表 product_info_st 只有 0x00(MT7621A) / 0x02 / 0x03 三项 */
+	if (id != 0 && id != 2 && id != 3) {
+		printf("MAX3: strap hw_id=%u 不在产品表(0/2/3)，按 0x00 处理\n", id);
+		id = 0;
+	}
+
+	cur = smem[MT7621_MBB_HWID_OFF / 4];
+
+	if (cur & 0xFFFFFF00UL) {
+		printf("MAX3: 共享内存未初始化（+0x60=0x%08x），清零前 0x90 字节\n",
+		       cur);
+		for (i = 0; i < 0x90 / 4; i++)
+			smem[i] = 0;
+	}
+
+	smem[MT7621_MBB_HWID_OFF / 4] = id;
+
+	if (smem[MT7621_MBB_HWID_OFF / 4] != id) {
+		printf("MAX3: 共享内存 +0x60 回读不一致！\n");
+		return;
+	}
+
+	printf("MAX3: MBB 共享内存 +0x%02x = 0x%02x（strap 13/15/16=%d/%d/%d）\n",
+	       MT7621_MBB_HWID_OFF, id, b13, b15, b16);
+}
+#endif
 
 #ifdef CONFIG_LAST_STAGE_INIT
 int last_stage_init(void)
@@ -96,11 +169,22 @@ int last_stage_init(void)
 
 #if defined(CONFIG_BOARD_MT7621_NAND_TEMPLATE)
 	#define MT7621_UNUSED_PIN_LIST {}
-#ifdef MT7621_LED_STATUS1
-	gpio_output_init(MT7621_LED_STATUS1, 0, "led-status");	// led status on
-#endif
 #ifdef MT7621_BUTTON_RESET
 	gpio_input_init(MT7621_BUTTON_RESET, "button-reset");	// init button reset
+#endif
+	/*
+	 * 三颗灯上电即定态：系统灯常亮（电源/存活指示），lte/nr 灭。
+	 * 注意极性：ACTIVE_HIGH(1) 才是亮，原厂模板这里写的 0 是灭，
+	 * 直接照抄会得到"上电全黑"，已按实测极性修正。
+	 */
+#ifdef MT7621_LED_STATUS1
+	gpio_output_init(MT7621_LED_STATUS1, MT7621_LED_ACTIVE_HIGH, "led-sys");
+#endif
+#ifdef MT7621_LED_STATUS2
+	gpio_output_init(MT7621_LED_STATUS2, !MT7621_LED_ACTIVE_HIGH, "led-lte");
+#endif
+#ifdef MT7621_LED_STATUS3
+	gpio_output_init(MT7621_LED_STATUS3, !MT7621_LED_ACTIVE_HIGH, "led-nr");
 #endif
 #else
 	#define MT7621_UNUSED_PIN_LIST {}
@@ -109,6 +193,14 @@ int last_stage_init(void)
 	int pinlist[] = MT7621_UNUSED_PIN_LIST;
 
 	pins_unused_init(pinlist, sizeof(pinlist)/sizeof(int));
+
+	/*
+	 * 必须在 Linux 起来之前补 MBB 共享区，模块 probe 时才读得到硬件 ID。
+	 * 这是 5G AT 通道全挂的根因修复点，详见 max3_mbb_smem_init() 注释。
+	 */
+#ifdef MT7621_MBB_SMEM_PHYS
+	max3_mbb_smem_init();
+#endif
 
 #ifndef CONFIG_BOARD_MT7621_NAND_TEMPLATE
 	/* configure the default state (auto-probe) */
