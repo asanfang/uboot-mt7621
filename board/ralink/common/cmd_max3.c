@@ -61,6 +61,87 @@
 #define M3_ENABLE 1
 #endif
 
+/* ---------------- LED 灯语 ----------------
+ *
+ * 三颗灯已在 last_stage_init 里 gpio_request + gpio_direction_output，
+ * 这里只做 gpio_set_value。极性 ACTIVE_HIGH：1 = 亮。
+ *
+ * 静态编码（可以一直挂着看，重启前不变）：
+ *   正常启动    sys 亮 / lte 灭 / nr 灭
+ *   网页救援    sys 亮 / lte 亮 / nr 灭     -> http://<ipaddr>/max3
+ *   网口救援    sys 亮 / lte 灭 / nr 亮     -> tftploop 等 max3.cmd
+ *
+ * 瞬态编码：
+ *   按键窗口    sys 每 100ms 翻转（肉眼能看到"还在计时"，松手即定格）
+ *   擦写中      sys 灭 / lte 亮 / nr 亮
+ *   擦写失败    sys 闪 3 次（300/200），然后保持 lte+nr 亮
+ */
+#ifdef MT7621_LED_STATUS1
+#define M3_LED_SYS	MT7621_LED_STATUS1
+#else
+#define M3_LED_SYS	(-1)
+#endif
+#ifdef MT7621_LED_STATUS2
+#define M3_LED_LTE	MT7621_LED_STATUS2
+#else
+#define M3_LED_LTE	(-1)
+#endif
+#ifdef MT7621_LED_STATUS3
+#define M3_LED_NR	MT7621_LED_STATUS3
+#else
+#define M3_LED_NR	(-1)
+#endif
+
+#define M3_LED_ON	1
+#define M3_LED_OFF	0
+
+/* 0 = 正常启动, 1 = 网页救援, 2 = 网口救援 */
+static int m3_led_mode;
+
+static void m3_led_raw(int gpio, int on)
+{
+	if (gpio >= 0)
+		gpio_set_value(gpio, on ? M3_LED_ON : M3_LED_OFF);
+}
+
+/* 按当前模式重设三颗灯：擦写结束后靠它把灯恢复成模式灯 */
+static void m3_led_apply(void)
+{
+	m3_led_raw(M3_LED_SYS, 1);
+	m3_led_raw(M3_LED_LTE, m3_led_mode == 1);
+	m3_led_raw(M3_LED_NR, m3_led_mode == 2);
+}
+
+/* 系统灯闪 times 次：亮 on_ms / 灭 off_ms */
+static void m3_led_flash(int times, int on_ms, int off_ms)
+{
+	if (M3_LED_SYS < 0)
+		return;
+
+	while (times-- > 0) {
+		m3_led_raw(M3_LED_SYS, 1);
+		mdelay(on_ms);
+		m3_led_raw(M3_LED_SYS, 0);
+		mdelay(off_ms);
+	}
+}
+
+/* 擦写中：三灯全亮，sys 灭掉以示"系统灯在忙" */
+static void m3_led_busy(void)
+{
+	m3_led_raw(M3_LED_SYS, 0);
+	m3_led_raw(M3_LED_LTE, 1);
+	m3_led_raw(M3_LED_NR, 1);
+}
+
+/* 擦写失败：sys 闪三下，lte+nr 保持亮 */
+static void m3_led_fail(void)
+{
+	m3_led_flash(3, 300, 200);
+	m3_led_raw(M3_LED_LTE, 1);
+	m3_led_raw(M3_LED_NR, 1);
+}
+
 static int m3_run(const char *fmt, ...)
 {
 	char buf[256];
@@ -129,10 +210,14 @@ static int m3_prog_src(ulong off, ulong erase_len, ulong size, ulong src,
 	printf("MAX3: 写 %s @0x%08lx，源 0x%lx，有效 0x%lx，写到 0x%lx，擦 0x%lx\n",
 	       what, off, src, size, wlen, erase_len);
 
+	/* 擦写期间给灯：三灯全亮、sys 灭 = 忙。写完/失败再恢复 */
+	m3_led_busy();
+
 	snprintf(cmd, sizeof(cmd), "nand erase 0x%lx 0x%lx", off, erase_len);
 	ret = run_command(cmd, 0);
 	if (ret) {
 		printf("MAX3: 擦除失败 %d\n", ret);
+		m3_led_fail();
 		return ret;
 	}
 
@@ -141,6 +226,7 @@ static int m3_prog_src(ulong off, ulong erase_len, ulong size, ulong src,
 	ret = run_command(cmd, 0);
 	if (ret) {
 		printf("MAX3: 写入失败 %d\n", ret);
+		m3_led_fail();
 		return ret;
 	}
 
@@ -149,14 +235,17 @@ static int m3_prog_src(ulong off, ulong erase_len, ulong size, ulong src,
 	ret = run_command(cmd, 0);
 	if (ret) {
 		printf("MAX3: 回读失败 %d\n", ret);
+		m3_led_fail();
 		return ret;
 	}
 
 	if (memcmp((void *)src, (void *)M3_VFY_ADDR, wlen)) {
 		printf("MAX3: 回读校验不一致，%s 不可信\n", what);
+		m3_led_fail();
 		return -1;
 	}
 
+	m3_led_apply();
 	printf("MAX3: %s 写入并校验通过\n", what);
 	return 0;
 }
@@ -231,6 +320,38 @@ static int m3_flash_uboot(void)
 	if (image_get_load(hdr) != CONFIG_SYS_TEXT_BASE) {
 		printf("MAX3: load 地址 0x%08x != 0x%08x\n",
 		       image_get_load(hdr), (unsigned)CONFIG_SYS_TEXT_BASE);
+		return -1;
+	}
+
+	/*
+	 * 尺寸与 data CRC 双校验：只验 hcrc 挡不住截断下载
+	 * （头 64 字节完好、data 少一截时 hcrc 依然正确，写下去 SPL 解压失败）。
+	 * 允许尾部补 0xFF 到 NAND 页边界（CI 产物就是补齐到 2048 的），
+	 * 但补出来的字节必须真的是 0xFF，否则等于往 0x5FFFF 之后写脏数据。
+	 */
+	{
+		ulong expect = sizeof(image_header_t) + image_get_data_size(hdr);
+		ulong maxpad = (expect + 0x7FF) & ~0x7FFUL;
+		ulong i;
+
+		if (size < expect || size > maxpad) {
+			printf("MAX3: 文件 %lu 字节，期望 [%lu,%lu]（64 头 + %u data）\n",
+			       size, expect, maxpad, image_get_data_size(hdr));
+			printf("MAX3: 尺寸不符，疑似截断或多传，拒绝\n");
+			return -1;
+		}
+
+		for (i = expect; i < size; i++) {
+			if (((const u8 *)M3_LOAD_ADDR)[i] != 0xFF) {
+				printf("MAX3: 尾部补齐区 @%lu 不是 0xFF，拒绝\n", i);
+				return -1;
+			}
+		}
+	}
+
+	if (!image_check_dcrc(hdr)) {
+		printf("MAX3: data CRC 不符（dcrc=0x%08x），载荷已损坏，拒绝\n",
+		       image_get_dcrc(hdr));
 		return -1;
 	}
 
@@ -320,6 +441,20 @@ static int m3_check_hdr(const struct m3_part *p, const void *data, ulong size)
 			       image_get_load(h), (unsigned)CONFIG_SYS_TEXT_BASE);
 			return -1;
 		}
+		/* 头/数据双 CRC：只验 hcrc 挡不住截断 */
+		if (!image_check_hcrc(h)) {
+			printf("MAX3: uboot 头 CRC 不符，拒绝\n");
+			return -1;
+		}
+		if (!image_check_dcrc(h)) {
+			printf("MAX3: uboot data CRC 不符，载荷已损坏，拒绝\n");
+			return -1;
+		}
+		if (size < sizeof(image_header_t) + image_get_data_size(h)) {
+			printf("MAX3: uboot 文件 %lu 字节小于头里声明的长度，拒绝\n",
+			       size);
+			return -1;
+		}
 	}
 
 	return 0;
@@ -403,8 +538,15 @@ static int m3_boot_slot(char slot)
 
 static void m3_httpd(void)
 {
-	printf("\nMAX3: 进入网页救援（http://%s/ ，上传镜像写 firmware 分区）\n",
+	m3_led_mode = 1;
+
+	printf("\nMAX3: 进入网页救援（http://%s/max3 ，按分区写镜像）\n",
 	       env_get("ipaddr") ? env_get("ipaddr") : "192.168.1.1");
+
+	/* 进入前闪两下当"提示音"，随后 sys+lte 常亮 = 网页救援态 */
+	m3_led_flash(2, 600, 300);
+	m3_led_apply();
+
 	run_command("httpd", 0);
 }
 
@@ -414,11 +556,21 @@ static void m3_tftploop(void)
 	char op[32], slot[8], img[64];
 	ulong fs;
 
+	m3_led_mode = 2;
+
 	printf("\nMAX3: 进入网口救援。PC 侧 ip=%s，反复 TFTP 取 max3.cmd\n",
 	       env_get("serverip") ? env_get("serverip") : "192.168.1.2");
 
+	/* 进入前闪三下（快节拍），随后 sys+nr 常亮 = 网口救援态 */
+	m3_led_flash(3, 200, 200);
+	m3_led_apply();
+
 	for (;;) {
 		if (m3_run("tftpboot 0x%lx max3.cmd", (ulong)M3_CMD_ADDR)) {
+			/* 每轮取不到就轻敲一下系统灯，表明还在等 */
+			m3_led_raw(M3_LED_SYS, 0);
+			mdelay(80);
+			m3_led_raw(M3_LED_SYS, 1);
 			mdelay(1000);
 			continue;
 		}
@@ -539,13 +691,20 @@ static int do_max3autoboot(cmd_tbl_t *cmdtp, int flag, int argc,
 	for (i = 0; i < M3_KEY_TFTP_STEPS; i++) {
 		if (!m3_key_down())
 			break;
+		/* 每 100ms 翻转一次系统灯：肉眼看得出还在计时，松手即定格 */
+		m3_led_raw(M3_LED_SYS, (i & 1) ? 0 : 1);
 		mdelay(M3_KEY_STEP_MS);
 	}
+
+	/* 松手瞬间回到常亮，再判档位 */
+	m3_led_raw(M3_LED_SYS, 1);
+
 	if (i) {
-		if (i >= M3_KEY_WEB_STEPS)
-			printf("MAX3: 检测到 reset 按住 %d00ms\n", i);
+		printf("MAX3: 检测到 reset 按住 %d00ms（>=1000ms 网页，>=3000ms 网口）\n",
+		       i);
 		if (m3_rescue_entry(i))
 			return 0;
+		printf("MAX3: 按住不足 1000ms，按正常启动处理\n");
 	}
 
 	slot = env_get("boot_slot");
