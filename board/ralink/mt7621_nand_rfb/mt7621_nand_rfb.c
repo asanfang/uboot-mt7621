@@ -576,6 +576,25 @@ static int max3_env_ids(void)
  */
 int misc_init_r(void)
 {
+#ifndef CONFIG_SPL_BUILD
+	/*
+	 * MAX3: 外置看门狗必须在这里就强制关闭，不能等 max3autoboot。
+	 *
+	 * 实测故障：停在 U-Boot 命令行时 max3autoboot 不会被执行，
+	 * max3_gpio_init() 因此不被调用，GPIO10 保持使能（高），
+	 * 约 56 秒被外置看门狗硬复位 —— 表现为"U-Boot 自动重启"。
+	 * gpio status 只看到 13/15/16(mbb-id*) 与 14(button-reset)，
+	 * 表里 17/11/12/9/6/5 一个都没 claim，正是这个问题的指纹。
+	 *
+	 * misc_init_r 在 board_init_r 早期执行，早于命令行、
+	 * 早于任何 tftp/NAND 操作，因此放在这里可以从根本上消除
+	 * "有人停在命令行 → 狗咬"的窗口。函数幂等，后续
+	 * max3_gpio_init() / m3_prog_src() 再调用也不会重复出错。
+	 */
+	extern int max3_wdt_disable(void);
+
+	max3_wdt_disable();
+#endif
 	max3_env_ids();
 	return 0;
 }
